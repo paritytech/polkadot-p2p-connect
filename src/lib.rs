@@ -1,7 +1,11 @@
 mod utils;
 
+pub mod error;
+
 use core::marker::PhantomData;
 use core::future::Future;
+use std::collections::HashMap;
+use error::{ ConnectionError, StreamError, ProtocolError };
 use utils::{
     async_stream,
     multistream,
@@ -10,6 +14,21 @@ use utils::{
     yamux,
     yamux_multistream,
 };
+
+// -----------------------------------------------------------
+// Platform
+// -----------------------------------------------------------
+
+pub trait PlatformT {
+    /// Fill the given bytes with random values.
+    fn fill_with_random_values(bytes: &mut [u8]);
+    /// Returns Err(()) if the given future times out, else returns the output from the future.
+    fn timeout<F: core::future::Future<Output = R>, R>(ms: usize, fut: F) -> impl Future<Output = Result<R, ()>>;
+}
+
+// -----------------------------------------------------------
+// Configuration
+// -----------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct Configuration<Platform> {
@@ -26,7 +45,7 @@ impl <Platform: PlatformT> Configuration<Platform> {
         }
     }
 
-    pub fn with_fixed_identity(mut self) -> Self {
+    pub fn with_generated_identity(mut self) -> Self {
         let mut random_bytes = [0u8; 32]; 
         Platform::fill_with_random_values(&mut random_bytes);
         self.identity_secret = Some(random_bytes);
@@ -38,21 +57,60 @@ impl <Platform: PlatformT> Configuration<Platform> {
         self
     }
 
-    pub async fn connect<Stream: async_stream::AsyncStream>(&self, stream: Stream) -> Result<Connection<Stream, Platform>, Error> {
+    pub async fn connect<Stream: async_stream::AsyncStream>(&self, stream: Stream) -> Result<Connection<Stream, Platform>, ConnectionError> {
         Connection::from_stream(stream, self.identity_secret, None).await
     }
 
-    pub async fn connect_to_peer<Stream: async_stream::AsyncStream>(&self, stream: Stream, peer_id: peer_id::PeerId) -> Result<Connection<Stream, Platform>, Error> {
+    pub async fn connect_to_peer<Stream: async_stream::AsyncStream>(&self, stream: Stream, peer_id: peer_id::PeerId) -> Result<Connection<Stream, Platform>, ConnectionError> {
         Connection::from_stream(stream, self.identity_secret, Some(peer_id)).await
     }
 }
 
-pub struct RequestResponseId(yamux_multistream::YamuxStreamId);
+// -----------------------------------------------------------
+// Connection
+// -----------------------------------------------------------
 
 pub struct Connection<Stream, Platform> {
     yamux: yamux_multistream::YamuxMultistream<noise::NoiseStream<Stream>>,
     remote_id: peer_id::PeerId,
+    request_response_streams: HashMap<yamux_multistream::YamuxStreamId, Request>,
     marker: PhantomData<(Platform,)>
+}
+
+pub enum Output {
+    RequestResponse {
+        id: RequestId,
+        res: RequestResponse,
+    },
+    Notification {
+        id: NotificationId,
+        res: NotificationResponse,
+    }
+}
+
+pub enum RequestResponse {
+    Data(Vec<u8>),
+    ProtocolRejected,
+    PayloadRejected,
+    MultistreamProtocolError,
+}
+
+pub enum NotificationResponse {
+
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RequestId(yamux_multistream::YamuxStreamId);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NotificationId {
+    outbound: yamux_multistream::YamuxStreamId,
+    inbound: yamux_multistream::YamuxStreamId,
+}
+
+enum Request {
+    AwaitingPayloadConfirmation(Vec<u8>),
+    AwaitingResponsePayload,
 }
 
 impl <Stream: async_stream::AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
@@ -60,15 +118,14 @@ impl <Stream: async_stream::AsyncStream, Platform: PlatformT> Connection<Stream,
         mut stream: Stream, 
         identity_secret: Option<[u8; 32]>,
         remote_peer_id: Option<peer_id::PeerId>
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, ConnectionError> {
         const NEGOTIATE_TIMEOUT_MS: usize = 10_000;
         const NOISE_HANDSHAKE_TIMEOUT_MS: usize = 30_000;
 
         // Agree to use the noise protocol.
         Platform::timeout(NEGOTIATE_TIMEOUT_MS, multistream::negotiate_dialer(&mut stream, "/noise"))
             .await
-            .map_err(|()| Error::NoiseNegotiationTimeout)?
-            .map_err(Error::Multistream)?;
+            .map_err(|()| ConnectionError::NoiseNegotiationTimeout)??;
 
         // Generate/use an identity for ourselves.
         let identity = match identity_secret {
@@ -80,17 +137,15 @@ impl <Stream: async_stream::AsyncStream, Platform: PlatformT> Connection<Stream,
             }
         };
 
-        // Establish our encypted noise session and find the remote Peer ID
+        // Establish our encrypted noise session and find the remote Peer ID
         let (mut noise_stream, remote_id) = Platform::timeout(NOISE_HANDSHAKE_TIMEOUT_MS, noise::handshake_dialer(stream, &identity, remote_peer_id.as_ref()))
             .await
-            .map_err(|()| Error::NoiseHandshakeTimeout)?
-            .map_err(Error::Noise)?;
+            .map_err(|()| ConnectionError::NoiseHandshakeTimeout)??;
 
         // Agree to use the yamux protocol in this noise stream.
         Platform::timeout(NEGOTIATE_TIMEOUT_MS, multistream::negotiate_dialer(&mut noise_stream, "/yamux/1.0.0"))
             .await
-            .map_err(|()| Error::YamuxNegotiationTimeout)?
-            .map_err(Error::Multistream)?;
+            .map_err(|()| ConnectionError::YamuxNegotiationTimeout)??;
             
         // Wrap our noise stream in a yamux session (we'll be using yamux substreams), and wrap
         // that in a YamuxMultistream adaptor to handle multistream negotiation on top of these
@@ -101,17 +156,106 @@ impl <Stream: async_stream::AsyncStream, Platform: PlatformT> Connection<Stream,
         Ok(Connection {
             yamux: yamux_multistream,
             remote_id,
-            marker: PhantomData 
+            request_response_streams: Default::default(),
+            marker: PhantomData
         })
     }
 
-    pub fn request_response<P: Into<String>>(&mut self, protocol: &str, request: &[u8]) -> Result<RequestResponseId, Error> {
+    pub fn request<P: Into<String>>(&mut self, protocol: &str, request: Vec<u8>) -> Result<RequestId, ConnectionError> {
+        // Open a stream and buffer data to be sent on it
         let stream_id = self.yamux.open_stream(Some(protocol))?;
 
-        // TODO: Save the request bytes somewhere and internally handle the message where the stream is accepted or rejected,
-        // returning a suitable output.
+        // Save the request to send once the stream is open.
+        self.request_response_streams.insert(stream_id, Request::AwaitingPayloadConfirmation(request));
 
-        Ok(RequestResponseId(stream_id))
+        Ok(RequestId(stream_id))
+    }
+
+    pub async fn next(&mut self) -> Option<Result<Output, StreamError>> {
+        self.next_inner().await.transpose()
+    }
+
+    async fn next_inner(&mut self) -> Result<Option<Output>, StreamError> {
+        loop {
+            let output = match self.yamux.next().await {
+                Some(Ok(output)) => output,
+                Some(Err(e)) => return Err(e.into()),
+                None => return Ok(None)
+            };
+
+            let stream_id = output.stream_id;
+
+            use yamux_multistream::OutputState;
+
+            // Is this a message on a request-response stream?
+            if let Some(info) = self.request_response_streams.get_mut(&stream_id) {
+                match info {
+                    Request::AwaitingPayloadConfirmation(request) => {
+                        match output.state {
+                            // The protocol has been accepted, so send the request payload and
+                            // start waiting for the response.
+                            OutputState::OutgoingAccepted(_) => {
+                                self.yamux.send_data(stream_id, &core::mem::take(request))?;
+                                *info = Request::AwaitingResponsePayload;
+                                continue
+                            },
+                            // Else if the protocol is invalid we'll relay that to the user.
+                            OutputState::OutgoingRejected => {
+                                self.request_response_streams.remove(&stream_id);
+                                return Ok(Some(Output::RequestResponse {
+                                    id: RequestId(stream_id),
+                                    res: RequestResponse::ProtocolRejected,
+                                }))
+                            },
+                            // If we see anything else then protocol is not being followed.
+                            // Close the stream and return the error to the user.
+                            _ => {
+                                self.request_response_streams.remove(&stream_id);
+                                self.yamux.close_stream_immediately(stream_id)?;
+                                return Ok(Some(Output::RequestResponse {
+                                    id: RequestId(stream_id),
+                                    res: RequestResponse::MultistreamProtocolError,
+                                }))
+                            },
+                        }
+                    },
+                    Request::AwaitingResponsePayload => {
+                        match output.state {
+                            // We got a response back! Give it to the user.
+                            OutputState::Data(bytes) => {
+                                self.request_response_streams.remove(&stream_id);
+                                return Ok(Some(Output::RequestResponse {
+                                    id: RequestId(stream_id),
+                                    res: RequestResponse::Data(bytes),
+                                }))
+                            }
+                            // If the payload is invalid, we will either get a valid
+                            // application-level response (ie above), or the substream 
+                            // will simply be closed.
+                            OutputState::Closed => {
+                                self.request_response_streams.remove(&stream_id);
+                                return Ok(Some(Output::RequestResponse {
+                                    id: RequestId(stream_id),
+                                    res: RequestResponse::PayloadRejected,
+                                }))
+                            },
+                            // If we see anything else then protocol is not being followed.
+                            // Close the stream and return the error to the user.
+                            _ => {
+                                self.request_response_streams.remove(&stream_id);
+                                self.yamux.close_stream_immediately(stream_id)?;
+                                return Ok(Some(Output::RequestResponse {
+                                    id: RequestId(stream_id),
+                                    res: RequestResponse::MultistreamProtocolError,
+                                }))
+                            },
+                        }
+                    }
+                }
+            }
+
+
+        }
     }
 
     // pub fn id(&mut self) -> Id {
@@ -131,25 +275,3 @@ impl <Stream: async_stream::AsyncStream, Platform: PlatformT> Connection<Stream,
     // }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("timeout negotiating noise stream")]
-    NoiseNegotiationTimeout,
-    #[error("timeout negotiating yamux stream")]
-    YamuxNegotiationTimeout,
-    #[error("timeout exchanging noise handshakes")]
-    NoiseHandshakeTimeout,
-    #[error("error negotiating multistream: {0}")]
-    Multistream(#[from] multistream::Error),
-    #[error("error establish noise encrypted stream: {0}")]
-    Noise(#[from] noise::Error),
-    #[error("yamux multistream error: {0}")]
-    YamuxMultistream(#[from] yamux_multistream::Error)
-}
-
-pub trait PlatformT {
-    /// Fill the given bytes with random values.
-    fn fill_with_random_values(bytes: &mut [u8]);
-    /// Returns Err(()) if the given future times out, else returns the output from the future.
-    fn timeout<F: core::future::Future<Output = R>, R>(ms: usize, fut: F) -> impl Future<Output = Result<R, ()>>;
-}

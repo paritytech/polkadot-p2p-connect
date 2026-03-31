@@ -61,6 +61,8 @@ pub enum Error {
     StreamNotFound(YamuxStreamId),
     #[error("we called accept_stream on stream {0} which is not waiting to be accepted")]
     StreamNotWaitingForAccept(YamuxStreamId),
+    #[error("we called send_data on stream {0} which is not ready for data yet (still negotiating protocol)")]
+    StreamNotOpen(YamuxStreamId),
     #[error("we called open_stream and provided an empty list of protocols")]
     NoProtocolsGiven,
 }
@@ -98,6 +100,19 @@ impl <S: async_stream::AsyncStream> YamuxMultistream<S> {
         Ok(stream_id)
     }
 
+    /// Send some data on the given stream. Errors if the protocol negotiation has not been
+    /// completed (ie if we have not yet seen [`OutputState::OutgoingAccepted`] for the given stream).
+    pub fn send_data(&mut self, stream_id: YamuxStreamId, data: &[u8]) -> Result<(), Error> {
+        let Some(stream) = self.bufs.get_mut(&stream_id) else {
+            return Err(Error::StreamNotFound(stream_id))
+        };
+        let MultistreamState::Open= &stream.state else {
+            return Err(Error::StreamNotOpen(stream_id))
+        };
+
+        self.send_multistream_data(stream_id, data)
+    }
+
     /// Accept a stream for which [`OutputState::IncomingProtocol`] was emitted.
     /// Errors if we call this for a stream that is not waiting to be accepted / rejected.
     pub fn accept_protocol(&mut self, stream_id: YamuxStreamId) -> Result<(), Error> {
@@ -130,6 +145,20 @@ impl <S: async_stream::AsyncStream> YamuxMultistream<S> {
         // Rejected; wait for another protocol suggestion on this stream and send the reject message.
         stream.state = MultistreamState::NewIncomingProtocol;
         self.send_multistream_data_with_newline(stream_id, b"na")?;
+        Ok(())
+    }
+
+    /// Close a stream.
+    pub fn close_stream(&mut self, stream_id: YamuxStreamId) -> Result<(), Error> {
+        self.bufs.remove(&stream_id);
+        self.inner.close_stream(stream_id)?;
+        Ok(())
+    }
+
+    /// Close a stream immediately, unbuffering any messages buffered to send prior to this call.
+    pub fn close_stream_immediately(&mut self, stream_id: YamuxStreamId) -> Result<(), Error> {
+        self.bufs.remove(&stream_id);
+        self.inner.close_stream_immediately(stream_id)?;
         Ok(())
     }
 
@@ -189,7 +218,7 @@ impl <S: async_stream::AsyncStream> YamuxMultistream<S> {
                         entry.state = MultistreamState::NewIncomingProtocol;
                         self.send_multistream_data(stream_id, MULTISTREAM_PROTOCOL_NAME_WITH_NEWLINE)?;
                     } else {
-                        self.close_and_remove_stream_immediately(stream_id);
+                        self.close_stream_immediately(stream_id)?;
                     }
                 }
                 // We've done the initial handshake and need to accept some protocol suggestion.
@@ -197,11 +226,11 @@ impl <S: async_stream::AsyncStream> YamuxMultistream<S> {
                 MultistreamState::NewIncomingProtocol => {
                     let mut protocol_bytes: Vec<u8> = byte_iter.collect();
                     if protocol_bytes.pop() != Some(b'\n') {
-                        self.close_and_remove_stream_immediately(stream_id);
+                        self.close_stream_immediately(stream_id)?;
                         continue
                     }
                     let Ok(protocol_name) = String::from_utf8(protocol_bytes) else {
-                        self.close_and_remove_stream_immediately(stream_id);
+                        self.close_stream_immediately(stream_id)?;
                         continue;
                     };
 
@@ -215,7 +244,7 @@ impl <S: async_stream::AsyncStream> YamuxMultistream<S> {
                 // accept it. So, just close the stream immediately and ignore the bytes.
                 MultistreamState::NewIncomingProtocolWaitingForAccept(_) => {
                     drop(byte_iter);
-                    self.close_and_remove_stream_immediately(stream_id);
+                    self.close_stream_immediately(stream_id)?;
                     continue;
                 },
                 // We initiated an outgoing stream and are waiting for them to accept/reject
@@ -227,7 +256,7 @@ impl <S: async_stream::AsyncStream> YamuxMultistream<S> {
                         if bytes_equal_iter(MULTISTREAM_PROTOCOL_NAME_WITH_NEWLINE, byte_iter) {
                             *seen_header = true;
                         } else {
-                            self.close_and_remove_stream_immediately(stream_id);
+                            self.close_stream_immediately(stream_id)?;
                         }
                     } else {
                         // multistream header seen so we are just negotiating the protocol name
@@ -245,7 +274,7 @@ impl <S: async_stream::AsyncStream> YamuxMultistream<S> {
                                 *current = next.clone();
                                 self.send_multistream_data_with_newline(stream_id, next.as_bytes())?;
                             } else {
-                                self.close_and_remove_stream_immediately(stream_id);
+                                self.close_stream_immediately(stream_id)?;
                                 return Ok(Some(Output {
                                     stream_id,
                                     state: OutputState::OutgoingRejected,
@@ -273,8 +302,8 @@ impl <S: async_stream::AsyncStream> YamuxMultistream<S> {
         let mut data_len = [0u8; 10];
         let varint_len = varint::encode(data.len() as u64, &mut data_len);
 
-        self.inner.send_data(stream_id, &data_len[..varint_len])?;
-        self.inner.send_data(stream_id, data)?;
+        self.inner.send_data(stream_id, data_len[..varint_len].iter().copied())?;
+        self.inner.send_data(stream_id, data.iter().copied())?;
         Ok(())
     }
 
@@ -285,16 +314,10 @@ impl <S: async_stream::AsyncStream> YamuxMultistream<S> {
         // Add 1 for the newline we'll append.
         let varint_len = varint::encode(data.len() as u64 + 1, &mut data_len);
 
-        self.inner.send_data(stream_id, &data_len[..varint_len])?;
-        self.inner.send_data(stream_id, data)?;
-        self.inner.send_data(stream_id, b"\n")?;
+        self.inner.send_data(stream_id, data_len[..varint_len].iter().copied())?;
+        self.inner.send_data(stream_id, data.iter().copied())?;
+        self.inner.send_data(stream_id, b"\n".iter().copied())?;
         Ok(())
-    }
-
-    /// Best effort close and remove a stream immediately.
-    fn close_and_remove_stream_immediately(&mut self, stream_id: YamuxStreamId) {
-        self.bufs.remove(&stream_id);
-        let _ = self.inner.close_stream_immediately(stream_id);
     }
 }
 

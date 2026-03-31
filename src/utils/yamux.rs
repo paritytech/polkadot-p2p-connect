@@ -137,17 +137,17 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
     /// Schedule some bytes to be sent on a given stream. Run [`Self::next()`] to 
     /// progress this. This respects the window size and may be slow to send if the
     /// receiver is slow or keeps the window size small on some stream.
-    pub fn send_data(&mut self, stream_id: YamuxStreamId, data: &[u8]) -> Result<(), Error> {
+    pub fn send_data(&mut self, stream_id: YamuxStreamId, data: impl IntoIterator<Item=u8>) -> Result<(), Error> {
         let Some(stream) = self.streams.get_mut(&stream_id) else {
             return Err(Error::StreamNotFound(stream_id))
         };
 
         match stream.outbound_buf.back_mut() {
             Some(BufferedOutboundMessage::Data(buffered_data)) => {
-                buffered_data.extend(data.iter().copied());
+                buffered_data.extend(data.into_iter());
             },
             Some(BufferedOutboundMessage::Open) | None => {
-                stream.outbound_buf.push_back(BufferedOutboundMessage::Data(data.iter().copied().collect()));
+                stream.outbound_buf.push_back(BufferedOutboundMessage::Data(data.into_iter().collect()));
             }
             Some(BufferedOutboundMessage::Close) => {
                 return Err(Error::StreamNotFound(stream_id))
