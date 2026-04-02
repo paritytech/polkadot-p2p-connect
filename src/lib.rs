@@ -25,7 +25,7 @@ use utils::{
 // Re-export anything that is part of the public APIs.
 pub use crate::utils::peer_id::PeerId;
 pub use crate::error::{ ConnectionError, StreamError, ProtocolError };
-pub use crate::utils::async_stream::AsyncStream;
+pub use crate::utils::async_stream::{AsyncStream, Error as AsyncStreamError};
 
 // -----------------------------------------------------------
 // Platform

@@ -16,7 +16,9 @@ pub trait AsyncStream {
     ) -> impl core::future::Future<Output = Result<(), Error>>;
 }
 
+/// Some error that has occurred reading or writing bytes from an implementation of [`AsyncStream`].
 #[derive(Debug, thiserror::Error)]
+#[allow(missing_docs)]
 pub enum Error {
     #[error("cannot read from stream: {0}")]
     ReadExact(Box<dyn core::error::Error + Send + Sync + 'static>),
@@ -25,9 +27,11 @@ pub enum Error {
 }
 
 impl Error {
+    /// Create an error relating to [`AsyncStream::read_exact`].
     pub fn read_exact<E: core::error::Error + Send + Sync + 'static>(e: E) -> Error {
         Error::ReadExact(Box::new(e))
     }
+    /// Create an error relating to [`AsyncStream::write_all`].
     pub fn write_all<E: core::error::Error + Send + Sync + 'static>(e: E) -> Error {
         Error::WriteAll(Box::new(e))
     }
