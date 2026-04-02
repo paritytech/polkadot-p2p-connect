@@ -1,3 +1,7 @@
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
+use alloc::borrow::ToOwned;
 use crate::utils::async_stream::{self, AsyncStream};
 use crate::utils::varint;
 
@@ -67,7 +71,7 @@ pub async fn negotiate_listener(
     }
 
     let proposal = read_msg(stream).await?;
-    let Ok(proposal_str) = std::str::from_utf8(&proposal) else {
+    let Ok(proposal_str) = core::str::from_utf8(&proposal) else {
         return Err(Error::ProposedProtocolIsNotUtf8(proposal));
     };
 

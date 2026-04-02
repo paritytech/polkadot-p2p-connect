@@ -6,8 +6,9 @@ use header::{
     FrameFlag,
     GoAwayType,
 };
+use alloc::vec;
 use crate::utils::async_stream;
-use std::collections::{HashMap, VecDeque};
+use alloc::collections::{BTreeMap, VecDeque};
 
 // Re-export types in the API
 pub use header::{
@@ -54,7 +55,7 @@ pub enum Error {
 pub struct YamuxSession<S> {
     inner: S,
     next_stream_id: YamuxStreamId,
-    streams: HashMap<YamuxStreamId, StreamState>,
+    streams: BTreeMap<YamuxStreamId, StreamState>,
     inbound_buf: [u8; MAX_FRAME_SIZE],
     failed: bool,
     output_buf: Option<InnerOutputState>,
@@ -111,7 +112,7 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
         Self {
             inner: stream,
             next_stream_id: YamuxStreamId::first(),
-            streams: HashMap::new(),
+            streams: BTreeMap::new(),
             inbound_buf: [0u8; MAX_FRAME_SIZE],
             failed: false,
             output_buf: None,

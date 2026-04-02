@@ -1,3 +1,5 @@
+use alloc::vec;
+use alloc::vec::Vec;
 use crate::utils::async_stream::{self, AsyncStream};
 use crate::utils::peer_id::{
     Identity, PeerId,

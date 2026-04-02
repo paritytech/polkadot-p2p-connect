@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use alloc::collections::VecDeque;
 use crate::utils::varint;
 
 /// A state machine which processes the bytes for a single mulistream,

@@ -1,4 +1,6 @@
-#[no_std]
+#![no_std]
+
+extern crate alloc;
 
 mod utils;
 
@@ -6,8 +8,11 @@ pub mod error;
 
 use core::marker::PhantomData;
 use core::future::Future;
-use std::collections::HashMap;
-use error::{ ConnectionError, StreamError, ProtocolError };
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use error::{ ConnectionError, StreamError };
 use utils::{
     async_stream,
     multistream,
@@ -75,7 +80,7 @@ impl <Platform: PlatformT> Configuration<Platform> {
 pub struct Connection<Stream, Platform> {
     yamux: yamux_multistream::YamuxMultistream<noise::NoiseStream<Stream>>,
     remote_id: peer_id::PeerId,
-    requests: HashMap<YamuxStreamId, RequestState>,
+    requests: BTreeMap<YamuxStreamId, RequestState>,
     subscriptions: Vec<SubscriptionDetails>,
     marker: PhantomData<(Platform,)>
 }

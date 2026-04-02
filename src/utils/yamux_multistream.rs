@@ -1,8 +1,10 @@
 mod frame_buffer;
 
+use alloc::string::String;
+use alloc::vec::Vec;
 use crate::utils::yamux::{self, YamuxSession};
 use crate::utils::{async_stream, varint};
-use std::collections::{HashMap, VecDeque};
+use alloc::collections::{BTreeMap, VecDeque};
 use core::mem;
 use frame_buffer::{MultistreamFrameBuffer, MultistreamFrameBufferOutput};
 
@@ -14,7 +16,7 @@ const MULTISTREAM_PROTOCOL_NAME_WITH_NEWLINE: &[u8] = b"/multistream/1.0.0\n";
 
 pub struct YamuxMultistream<S> {
     inner: YamuxSession<S>,
-    bufs: HashMap<YamuxStreamId, Multistream>,
+    bufs: BTreeMap<YamuxStreamId, Multistream>,
 }
 
 pub struct Output {
@@ -71,7 +73,7 @@ impl <S: async_stream::AsyncStream> YamuxMultistream<S> {
     pub fn new(yamux_session: YamuxSession<S>) -> Self {
         Self {
             inner: yamux_session,
-            bufs: HashMap::new(),
+            bufs: BTreeMap::new(),
         }
     }
 
