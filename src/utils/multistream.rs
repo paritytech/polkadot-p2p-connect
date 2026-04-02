@@ -1,7 +1,6 @@
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use alloc::borrow::ToOwned;
 use crate::utils::async_stream::{self, AsyncStream};
 use crate::utils::varint;
 
@@ -57,41 +56,6 @@ pub async fn negotiate_dialer(
     }
 
     Ok(())
-}
-
-/// Listener-side multistream-select: accept or reject a proposal.
-/// Returns the negotiated protocol name (without trailing newline).
-pub async fn negotiate_listener(
-    stream: &mut impl AsyncStream,
-    supported: &[&str],
-) -> Result<String, Error> {
-    let header = read_msg(stream).await?;
-    if header != MULTISTREAM_HEADER {
-        return Err(Error::BadMultiStreamHeader(to_string(&header)))
-    }
-
-    let proposal = read_msg(stream).await?;
-    let Ok(proposal_str) = core::str::from_utf8(&proposal) else {
-        return Err(Error::ProposedProtocolIsNotUtf8(proposal));
-    };
-
-    // Reject if no supported match the proposed
-    if supported.iter().all(|&s| s != proposal_str) {
-        // Tell the remote that we don't support the protocol.
-        let mut resp = Vec::new();
-        encode_msg(MULTISTREAM_HEADER, &mut resp);
-        encode_msg(b"na", &mut resp);
-        stream.write_all(&resp).await?;
-
-        return Err(Error::ProtocolNotSupported(proposal_str.to_owned()))
-    }
-
-    // Or, accept and return the accepted protocol name
-    let mut resp = Vec::new();
-    encode_msg(MULTISTREAM_HEADER, &mut resp);
-    encode_msg(&proposal, &mut resp);
-    stream.write_all(&resp).await?;
-    Ok(proposal_str.to_string())
 }
 
 // -- helpers ----------------------------------------------------------------

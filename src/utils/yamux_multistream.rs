@@ -27,7 +27,11 @@ pub struct Output {
 pub enum OutputState {
     IncomingProtocol(String),
     OutgoingRejected,
-    OutgoingAccepted(String),
+    // We don't need the outgoing protocol name because at a higher level
+    // we only try one protocol at a time, but at this level we should not
+    // ignore it since many protocols could be given and we need to know
+    // which one was accepted.
+    OutgoingAccepted(#[allow(dead_code)] String),
     Data(Vec<u8>),
     Closed,
 }
