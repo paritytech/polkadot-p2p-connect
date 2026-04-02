@@ -1,10 +1,12 @@
+//! This crate is used to establish a peer-to-peer connection with a node on the Polkadot network.
+
 #![no_std]
+#![deny(missing_docs)]
 
 extern crate alloc;
 
 mod utils;
-
-pub mod error;
+mod error;
 
 use core::marker::PhantomData;
 use core::future::Future;
@@ -12,7 +14,6 @@ use alloc::collections::{BTreeMap, vec_deque::VecDeque};
 use alloc::vec::Vec;
 use alloc::string::String;
 use alloc::boxed::Box;
-use error::{ ConnectionError, StreamError };
 use utils::{
     async_stream,
     multistream,
@@ -24,11 +25,13 @@ use utils::{
 
 // Re-export anything that is part of the public APIs.
 pub use crate::utils::peer_id::PeerId;
+pub use crate::error::{ ConnectionError, StreamError, ProtocolError };
 
 // -----------------------------------------------------------
 // Platform
 // -----------------------------------------------------------
 
+/// This trait provides any core features that we need which may vary by platform.
 pub trait PlatformT {
     /// Fill the given buffer with random bytes.
     fn fill_with_random_bytes(bytes: &mut [u8]);
@@ -40,6 +43,7 @@ pub trait PlatformT {
 // Configuration
 // -----------------------------------------------------------
 
+/// Configuration for connections.
 #[derive(Debug, Clone)]
 pub struct Configuration<Platform> {
     identity_secret: Option<[u8; 32]>,
@@ -55,15 +59,22 @@ impl <Platform: PlatformT> Configuration<Platform> {
         }
     }
 
+    /// Set a static identity that will be used for all connections using this configuration.
+    /// If this is not provided then a unique random identity will be created for each connection.
     pub fn with_identity(mut self, secret_bytes: [u8; 32]) -> Self {
         self.identity_secret = Some(secret_bytes);
         self
     }
 
+    /// Connect to a peer given some read/write byte stream that has already been established with it.
+    /// If we know the expected peer ID then we can use [`Self::connect_to_peer`] to provide this ID,
+    /// which will then check that it is correct.
     pub async fn connect<Stream: async_stream::AsyncStream>(&self, stream: Stream) -> Result<Connection<Stream, Platform>, ConnectionError> {
         Connection::from_stream(stream, self.identity_secret, None).await
     }
 
+    /// Connect to a peer given some read/write byte stream that has already been established with it,
+    /// and the expected identity of the peer. If the identity does not match then the connection will be rejected.
     pub async fn connect_to_peer<Stream: async_stream::AsyncStream>(&self, stream: Stream, peer_id: PeerId) -> Result<Connection<Stream, Platform>, ConnectionError> {
         Connection::from_stream(stream, self.identity_secret, Some(peer_id)).await
     }
@@ -73,6 +84,7 @@ impl <Platform: PlatformT> Configuration<Platform> {
 // Connection
 // -----------------------------------------------------------
 
+/// A connection to a single peer.
 pub struct Connection<Stream, Platform> {
     yamux: yamux_multistream::YamuxMultistream<noise::NoiseStream<Stream>>,
     remote_id: PeerId,
@@ -128,12 +140,14 @@ impl SubscriptionState {
 /// [`Connection::request()`] that we call, and a stream of [`Message::Notification`]s for any
 /// [`Connection::subscribe()`] subscription that we create.
 pub enum Message {
+    /// A response to some [`Connection::request()`].
     Response {
         /// The [`RequestId`] that this message is for.
         id: RequestId,
         /// A response for this request.
         res: RequestResponse,
     },
+    /// A notification for some [`Connection::subscribe()`] subscription.
     Notification {
         /// The [`SubscriptionId`] that this notification is for.
         id: SubscriptionId,
@@ -258,14 +272,18 @@ impl <Stream: async_stream::AsyncStream, Platform: PlatformT> Connection<Stream,
         })
     }
 
+    /// The peer ID that we have used for this connection.
     pub fn our_id(&self) -> &PeerId {
         &self.our_id
     }
 
+    /// The connected peer's ID.
     pub fn their_id(&self) -> &PeerId {
         &self.remote_id
     }
 
+    /// Make a request to some protocol name (essentially the unique ID/path for the request) and request body.
+    /// This returns a [`RequestId`]. We will get back exactly one response using this ID from [`Self::next`].
     pub fn request(&mut self, protocol: &str, request: Vec<u8>) -> Result<RequestId, ConnectionError> {
         // Open a stream.
         let stream_id = self.yamux.open_stream(Some(protocol))?;
@@ -276,14 +294,20 @@ impl <Stream: async_stream::AsyncStream, Platform: PlatformT> Connection<Stream,
         Ok(RequestId(stream_id))
     }
 
+    /// Cancel a request. This makes a best-effort attempt to cancel an in-flight request when driven by [`Self::next`], 
+    /// and will lead to a [`RequestResponse::Cancelled`] message being emitted for the given request ID.
     pub fn cancel_request(&mut self, id: RequestId) {
         self.requests.remove(&id.0);
+        let _ = self.yamux.close_stream(id.0);
         self.next_buf.push_back(Message::Response { 
             id, 
             res: RequestResponse::Cancelled,
         });
     }
 
+    /// Subscribe to some protocol name (essentially the unique ID/path for the subscription) and a handshake.
+    /// This returns a [`SubscriptionId`]. We will get back a stream of notification messages against this ID when
+    /// call [`Self::next`], until the subscription is closed, cancelled or returns an error.
     pub fn subscribe<F: FnMut(Vec<u8>) -> bool + 'static>(&mut self, protocol: impl Into<String>, handshake: Vec<u8>, validate: F) -> Result<SubscriptionId, ConnectionError> {
         let protocol = protocol.into();
         if let Some(details) = self.subscriptions.iter().find(|s| &s.protocol_name == &protocol) {
@@ -303,6 +327,8 @@ impl <Stream: async_stream::AsyncStream, Platform: PlatformT> Connection<Stream,
         Ok(SubscriptionId { outgoing_stream: stream_id })
     }
 
+    /// Cancel a subscription. This makes a best-effort attempt to cancel an in-flight subscription when driven by [`Self::next`], 
+    /// and will lead to a [`SubscriptionResponse::Closed`] message being emitted for the given subscription ID.
     pub fn cancel_subscription(&mut self, id: SubscriptionId) {
         let Some(index) = self.subscriptions.iter().position(|s| s.outgoing_stream == id.outgoing_stream) else {
             return
@@ -324,6 +350,7 @@ impl <Stream: async_stream::AsyncStream, Platform: PlatformT> Connection<Stream,
         });
     }
 
+    /// Drive this connection, making progress and returning messages as they are received.
     pub async fn next(&mut self) -> Option<Result<Message, StreamError>> {
         self.next_inner().await.transpose()
     }

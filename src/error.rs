@@ -7,6 +7,7 @@ use crate::utils::{
 
 /// An error that can occur establishing a connection with some peer.
 #[derive(Debug, thiserror::Error)]
+#[allow(missing_docs)]
 pub enum ConnectionError {
     #[error("timeout negotiating noise stream")]
     NoiseNegotiationTimeout,
@@ -22,6 +23,7 @@ pub enum ConnectionError {
 
 /// An error that can occur processing messages to/from a peer.
 #[derive(Debug, thiserror::Error)]
+#[allow(missing_docs)]
 pub enum StreamError {
     #[error("internal protocol error: {0}")]
     ProtocolError(#[from] ProtocolError),

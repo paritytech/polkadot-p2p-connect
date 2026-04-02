@@ -188,7 +188,7 @@ pub struct PeerId {
 
 impl PeerId {
     // Take an ed25519 public key and convert it to a PeerId.
-    pub fn from_ed25519_public_key(key: [u8; 32]) -> Self {
+    pub (crate) fn from_ed25519_public_key(key: [u8; 32]) -> Self {
         let mut multihash = Vec::with_capacity(36);
         multihash.push(0x00);
 
@@ -212,13 +212,11 @@ impl PeerId {
     pub fn from_base58(s: &str) -> Result<Self, bs58::decode::Error> {
         let bytes = bs58::decode(s).into_vec()?;
 
-        // // Validate multihash structure: code (varint) + length (varint) + digest
+        //// TODO: Validate multihash structure: code (varint) + length (varint) + digest
         // {
         //     let cursor = &mut &*bytes;
-    
         //     let code = varint::decode(cursor)?;
         //     let digest_len = varint::decode(cursor)?;
-    
         //     // The remaining bytes should equal the length.
         //     if cursor.len() != digest_len {
         //         // TODO: Validate
@@ -228,6 +226,7 @@ impl PeerId {
         Ok(PeerId { multihash: bytes })
     }
 
+    /// Convert a [`PeerId`] to a base58 string.
     pub fn to_base58(&self) -> String {
         bs58::encode(&self.multihash).into_string()
     }
