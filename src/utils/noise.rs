@@ -1,5 +1,7 @@
+use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
+use crate::PlatformT;
 use crate::utils::async_stream::{self, AsyncStream};
 use crate::utils::peer_id::{
     Identity, PeerId,
@@ -35,13 +37,16 @@ pub enum Error {
 /// Perform the Noise XX handshake as the dialer (initiator).
 ///
 /// Returns the encrypted transport stream and the authenticated remote PeerId.
-pub async fn handshake_dialer<S: AsyncStream>(
+pub async fn handshake_dialer<S: AsyncStream, P: PlatformT>(
     mut stream: S,
     identity: &Identity,
     expected_peer_id: Option<&PeerId>,
 ) -> Result<(NoiseStream<S>, PeerId), Error> {
-    // Build a snow initiator with a fresh ephemeral X25519 keypair.
-    let builder = snow::Builder::new(NOISE_PARAMS.parse()?);
+    // Build a snow initiator using our Platform RNG so this works in no_std.
+    let builder = snow::Builder::with_resolver(
+        NOISE_PARAMS.parse()?,
+        Box::new(CryptoResolver::from_platform::<P>()),
+    );
     let dh_keys = builder.generate_keypair()?;
     let mut noise = builder
         .local_private_key(&dh_keys.private)
@@ -198,5 +203,42 @@ impl<S: AsyncStream> AsyncStream for NoiseStream<S> {
             self.inner.write_all(&frame).await?;
         }
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Use our RNG from PlatformT with snow for any noise bits
+// ---------------------------------------------------------------------------
+
+#[derive(Copy, Clone)]
+struct CryptoResolver(fn(&mut [u8]));
+
+impl CryptoResolver {
+    /// Bridge PlatformT's RNG into snow's [`snow::resolvers::CryptoResolver`] so that snow 
+    /// can generate ephemeral keys even in a no_std environment without getrandom.
+    fn from_platform<P: PlatformT>() -> Self {
+        CryptoResolver(P::fill_with_random_bytes)
+    }
+}
+
+impl snow::types::Random for CryptoResolver {
+    fn try_fill_bytes(&mut self, out: &mut [u8]) -> Result<(), snow::Error> {
+        (self.0)(out);
+        Ok(())
+    }
+}
+
+impl snow::resolvers::CryptoResolver for CryptoResolver {
+    fn resolve_rng(&self) -> Option<Box<dyn snow::types::Random>> {
+        Some(Box::new(*self))
+    }
+    fn resolve_dh(&self, choice: &snow::params::DHChoice) -> Option<Box<dyn snow::types::Dh>> {
+        snow::resolvers::DefaultResolver.resolve_dh(choice)
+    }
+    fn resolve_hash(&self, choice: &snow::params::HashChoice) -> Option<Box<dyn snow::types::Hash>> {
+        snow::resolvers::DefaultResolver.resolve_hash(choice)
+    }
+    fn resolve_cipher(&self, choice: &snow::params::CipherChoice) -> Option<Box<dyn snow::types::Cipher>> {
+        snow::resolvers::DefaultResolver.resolve_cipher(choice)
     }
 }

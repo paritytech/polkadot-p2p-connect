@@ -135,6 +135,10 @@ impl YamuxStreamId {
     pub fn first() -> Self {
         YamuxStreamId(1)
     }
+    /// Return the first stream ID that server will use (always an even number)
+    pub fn first_server() -> Self {
+        YamuxStreamId(2)
+    }
     /// Increment the stream ID to the next one for clients to use (always an odd number)
     pub fn increment(&mut self) {
         self.0 += 2

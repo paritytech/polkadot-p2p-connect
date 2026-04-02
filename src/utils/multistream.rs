@@ -61,7 +61,8 @@ pub async fn negotiate_dialer(
 // -- helpers ----------------------------------------------------------------
 
 fn encode_msg(payload: &[u8], out: &mut Vec<u8>) {
-    varint::encode(payload.len() as u64, out);
+    // The payload length includes the newline we'll append, so + 1:
+    varint::encode_to_vec(payload.len() as u64 + 1, out);
     out.extend_from_slice(payload);
     out.push(b'\n');
 }

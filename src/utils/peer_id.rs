@@ -199,11 +199,14 @@ impl PeerId {
         //   - 1 byte: field 2 data length (32).
         //   - 32 bytes: field 2 data (key bytes).
         // See decode_ed25519_public_key_protobuf which follows this.
-        varint::encode(36, &mut multihash);
+        varint::encode_to_vec(36, &mut multihash);
 
-        protobuf::encode(&mut multihash)
+        let mut buf = [0u8; 36];
+        let n = protobuf::encode(&mut buf)
             .encode_varint(1, 1u8)
-            .encode_data(2, &key);
+            .encode_data(2, &key)
+            .num_encoded();
+        multihash.extend_from_slice(&buf[..n]);
 
         PeerId { multihash }
     }

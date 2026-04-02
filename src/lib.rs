@@ -246,7 +246,7 @@ impl <Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
         };
 
         // Establish our encrypted noise session and find the remote Peer ID
-        let (mut noise_stream, remote_id) = Platform::timeout(NOISE_HANDSHAKE_TIMEOUT_MS, noise::handshake_dialer(stream, &identity, remote_peer_id.as_ref()))
+        let (mut noise_stream, remote_id) = Platform::timeout(NOISE_HANDSHAKE_TIMEOUT_MS, noise::handshake_dialer::<_, Platform>(stream, &identity, remote_peer_id.as_ref()))
             .await
             .map_err(|()| ConnectionError::NoiseHandshakeTimeout)??;
 

@@ -112,7 +112,7 @@ impl <S: async_stream::AsyncStream> YamuxMultistream<S> {
         let Some(stream) = self.bufs.get_mut(&stream_id) else {
             return Err(Error::StreamNotFound(stream_id))
         };
-        let MultistreamState::Open= &stream.state else {
+        let MultistreamState::Open = &stream.state else {
             return Err(Error::StreamNotOpen(stream_id))
         };
 
@@ -186,6 +186,13 @@ impl <S: async_stream::AsyncStream> YamuxMultistream<S> {
             let stream_id = output.stream_id;
             let bytes = match output.state {
                 yamux::OutputState::Data(bytes) => bytes,
+                yamux::OutputState::OpenedByRemote => {
+                    // This is a new stream, so add an entry for it.
+                    self.bufs.insert(stream_id, Multistream {
+                        buffer: MultistreamFrameBuffer::new(),
+                        state: MultistreamState::NewIncoming
+                    });
+                },
                 yamux::OutputState::ClosedByRemote => {
                     // Technically the stream may have been "half closed" (ie we can still send but they won't)
                     // or "full closed" (ie they won't send and we aren't allowed to), but I don't think we care
@@ -196,12 +203,11 @@ impl <S: async_stream::AsyncStream> YamuxMultistream<S> {
             };
     
             // Fetch the stream details.
-            let entry = self.bufs.entry(stream_id).or_insert_with(|| {
-                Multistream {
-                    buffer: MultistreamFrameBuffer::new(),
-                    state: MultistreamState::NewIncoming
-                }
-            });
+            // ignore any messages on a stream we don't know about (they could be messages sent after
+            // we sent a close request for instance)
+            let Some(entry) = self.bufs.get_mut(&stream_id) else {
+                continue
+            }
 
             // Feed bytes to the stream buffer, returning multistream frames as they are available.
             let byte_iter = match entry.buffer.feed(bytes) {
@@ -266,7 +272,8 @@ impl <S: async_stream::AsyncStream> YamuxMultistream<S> {
                         }
                     } else {
                         // multistream header seen so we are just negotiating the protocol name
-                        if bytes_equal_iter(current.as_bytes(), byte_iter) {
+                        let current_with_newline = current.as_bytes().iter().copied().chain(Some(b'\n'));
+                        if iters_equal(current_with_newline, byte_iter) {
                             // Protocol matches response; all good!
                             let current = mem::take(current);
                             entry.state = MultistreamState::Open;
@@ -327,17 +334,32 @@ impl <S: async_stream::AsyncStream> YamuxMultistream<S> {
     }
 }
 
+/// Do two iterators have identical contents?
+fn iters_equal(mut a: impl Iterator<Item=u8>, mut b: impl Iterator<Item=u8>) -> bool {
+    loop {
+        match (a.next(), b.next()) {
+            // False if items don't match.
+            (Some(a1), Some(b1)) => {
+                if a1 != b1 {
+                    return false
+                }
+            },
+            // True if we get to the end of both together.
+            (None, None) => {
+                return true
+            },
+            // False otherwise (1 iter has remaining items and other does not).
+            _ => {
+                return false
+            }
+        }
+    }
+}
+
 /// Does some iterator of bytes equal the given slice?
 fn bytes_equal_iter(value: &[u8], iter: impl ExactSizeIterator<Item=u8>) -> bool {
     if value.len() != iter.len() {
         return false
     }
-
-    for (a, b) in value.iter().zip(iter) {
-        if *a != b {
-            return false
-        }
-    }
-
-    true
+    iters_equal(value.iter().copied(), iter)
 }

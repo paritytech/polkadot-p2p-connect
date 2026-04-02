@@ -14,14 +14,13 @@ impl <'a> Encoder<'a> {
     pub fn encode_varint(mut self, field_id: u64, value: impl Into<u64>) -> Self {
         self.encode_field_id_and_wire_type(field_id, WireType::Varint);
         // Encode value as varint
-        let value = value.into();
-        varint::encode(value, self.out);
+        self.encode_varint_value(value.into());
         self
     }
     pub fn encode_data(mut self, field_id: u64, data: &[u8]) -> Self {
         self.encode_field_id_and_wire_type(field_id, WireType::Data);
         // Encode length first
-        varint::encode(data.len() as u64, self.out);
+        self.encode_varint_value(data.len() as u64);
         // Then encode data, advancing the cursor
         self.out[..data.len()].copy_from_slice(data);
         self.out = &mut self.out[data.len()..];
@@ -32,8 +31,13 @@ impl <'a> Encoder<'a> {
     }
     fn encode_field_id_and_wire_type(&mut self, field_id: u64, wire_type: WireType) {
         let wire_type_u8: u8 = wire_type.into();
-        let tag_value = (field_id << 3) & (wire_type_u8 as u64);
-        varint::encode(tag_value, self.out);
+        let tag_value = (field_id << 3) | (wire_type_u8 as u64);
+        self.encode_varint_value(tag_value);
+    }
+    fn encode_varint_value(&mut self, val: u64) {
+        let n = varint::encode(val, self.out);
+        let out = core::mem::take(&mut self.out);
+        self.out = &mut out[n..];
     }
 }
 

@@ -1,4 +1,5 @@
 use crate::utils::async_stream::{self, AsyncStream};
+use alloc::vec::Vec;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -10,8 +11,12 @@ pub enum Error {
     UnexpectedEndOfInput,
 }
 
-/// Encode a usize as an unsigned varint, returning the number of bytes written.
-/// Panics if the buffer to encode it to is not large enough.
+/// Encode a u64 as an unsigned varint, returning the number of bytes written.
+/// Prefer [`encode_to_vec`] where possible as this cannot hit out-of-bound issues.
+/// 
+/// # Panics
+/// 
+/// Panics if the buffer given to encode it to is not large enough.
 pub fn encode(mut value: u64, out: &mut [u8]) -> usize {
     let mut idx = 0;
     loop {
@@ -33,6 +38,15 @@ pub fn encode(mut value: u64, out: &mut [u8]) -> usize {
 
     // Return the number of bytes written.
     idx
+}
+
+/// Encode a u64 as an unsigned varint. Unlike [`encode`], this encodes directly
+/// to a growable vector and thus won't hit any out of bound issues, as the vector
+/// can grow as needed.
+pub fn encode_to_vec(value: u64, out: &mut Vec<u8>) {
+    let mut buf = [0u8; 10];
+    let n = encode(value, &mut buf);
+    out.extend_from_slice(&buf[..n]);
 }
 
 /// Decode some bytes as a varint into a u64. This advanced the given
@@ -106,11 +120,11 @@ impl Decoder {
         self.len += 1;
         
         if byte & 0b1000_0000 == 0 {
-            // It is not the last byte; return Self so more bytes can be given.
-            DecoderOutput::NeedsMoreBytes(self)
-        } else {
-            // The given byte is the final one; decode!
+            // MSB not set: this is the last byte; decode!
             DecoderOutput::Value(self.decode_valid_bytes())
+        } else {
+            // MSB set: more bytes will follow.
+            DecoderOutput::NeedsMoreBytes(self)
         }
     }
 
