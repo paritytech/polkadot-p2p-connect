@@ -4,9 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-snow = "0.10.0"
-thiserror = "2.0.18"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-rand = "0.8"
-bs58 = "0.5"
-sha2 = "0.10"
+snow = { version = "0.10.0", default-features = false, features = ["default-resolver", "use-curve25519", "use-chacha20poly1305", "use-sha2"] }
+thiserror = { version = "2.0.18", default-features = false }
+ed25519-dalek = { version = "2", default-features = false, features = ["rand_core"] }
+bs58 = { version = "0.5", default-features = false, features = ["alloc"] }
