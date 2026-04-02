@@ -57,7 +57,6 @@ pub enum Error {
 pub struct YamuxSession<S> {
     inner: S,
     next_stream_id: YamuxStreamId,
-    their_latest_stream_id: YamuxStreamId,
     streams: BTreeMap<YamuxStreamId, StreamState>,
     inbound_buf: [u8; MAX_FRAME_SIZE],
     failed: bool,
@@ -73,8 +72,6 @@ pub struct Output<'a> {
 }
 
 pub enum OutputState<'a> {
-    /// This is a new stream, opened by the server.
-    OpenedByRemote,
     /// Some data was received on this stream. It may be a new stream.
     Data(&'a [u8]),
     /// This stream was closed by the remote.
@@ -82,7 +79,6 @@ pub enum OutputState<'a> {
 }
 
 enum InnerOutputState {
-    OpenedByRemote(YamuxStreamId),
     Data(YamuxStreamId, usize),
     ClosedByRemote(YamuxStreamId),
 }
@@ -120,7 +116,6 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
         Self {
             inner: stream,
             next_stream_id: YamuxStreamId::first(),
-            their_latest_stream_id: YamuxStreamId::first_server(),
             streams: BTreeMap::new(),
             inbound_buf: [0u8; MAX_FRAME_SIZE],
             failed: false,
@@ -217,10 +212,6 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
         res.transpose().map(|res| {
             res.map(|inner_state| {
                 match inner_state {
-                    InnerOutputState::OpenedByRemote(id) => Output {
-                        stream_id: id,
-                        state: OutputState::OpenedByRemote,
-                    },
                     InnerOutputState::ClosedByRemote(id) => Output {
                         stream_id: id,
                         state: OutputState::ClosedByRemote,
@@ -262,6 +253,10 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
                         return Err(Error::FrameTooLarge(data_len));
                     }
 
+                    // Read the data bytes into our buffer. For almost anything we do, we
+                    // need to drain these bytes else we'll be out of sync for the next loop.
+                    self.inner.read_exact(&mut self.inbound_buf[..data_len]).await?;
+
                     // If new stream, negotiate and loop if it was rejected.
                     if hdr.flags.contains(FrameFlag::Syn) && !self.negotiate_new_stream_request(&hdr).await? {
                         continue
@@ -271,7 +266,6 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
                     // that we have closed the stream recently. If remote_fin was sent then we should
                     // definitely get no more data on it.
                     let Some(stream) = self.streams.get_mut(&hdr.stream_id) else {
-                        self.drain_bytes_from_stream(hdr.length as usize).await?;
                         continue
                     };
                     if stream.remote_fin {
@@ -303,8 +297,6 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
                     } else if hdr.flags.contains(FrameFlag::Fin) {
                         stream.remote_fin = true;
                         self.output_buf = Some(InnerOutputState::ClosedByRemote(hdr.stream_id));
-                    } else if hdr.flags.contains(FrameFlag::Syn) {
-                        self.output_buf = Some(InnerOutputState::OpenedByRemote(hdr.stream_id));
                     }
 
                     return Ok(Some(InnerOutputState::Data(hdr.stream_id, data_len)))
@@ -341,8 +333,6 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
                     if hdr.flags.contains(FrameFlag::Fin) {
                         stream.remote_fin = true;
                         return Ok(Some(InnerOutputState::ClosedByRemote(hdr.stream_id)))
-                    } else if hdr.flags.contains(FrameFlag::Syn) {
-                        self.output_buf = Some(InnerOutputState::OpenedByRemote(hdr.stream_id));
                     }
                 },
                 FrameType::Ping => {
@@ -449,12 +439,6 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
     ///   consume any data from the rejected frame if necessary.
     /// - If this returns an error, then we are done and should stop immediately.
     async fn negotiate_new_stream_request(&mut self, hdr: &YamuxHeader) -> Result<bool, Error> {
-        // new stream ID should be greater than any seen before, else it is not new.
-        if hdr.stream_id <= self.their_latest_stream_id {
-            return Err(Error::InvalidStreamId(hdr.stream_id))
-        }
-        self.their_latest_stream_id = hdr.stream_id;
-
         // they should always send even stream ID numbers, and not the session ID number.
         if !hdr.stream_id.is_even() || hdr.stream_id.is_session_id() {
             self.inner.write_all(&YamuxHeader::reject_stream(hdr.stream_id).encode()).await?;
@@ -464,9 +448,6 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
         // if they try to open too many streams, reject it but all good protocol wise.
         if self.streams.len() > MAX_STREAMS {
             self.inner.write_all(&YamuxHeader::reject_stream(hdr.stream_id).encode()).await?;
-            if hdr.frame_type == FrameType::Data {
-                self.drain_bytes_from_stream(hdr.length as usize).await?;
-            }
             return Ok(false)
         }
 

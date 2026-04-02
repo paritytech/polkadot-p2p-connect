@@ -59,7 +59,7 @@ enum MultistreamState {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("yamux error reading stream: {0}")]
+    #[error("yamux error: {0}")]
     Yamux(#[from] YamuxError),
     #[error("failed to decode varint at the front of the next multistream frame")]
     VarintOutOfRange,
@@ -186,13 +186,6 @@ impl <S: async_stream::AsyncStream> YamuxMultistream<S> {
             let stream_id = output.stream_id;
             let bytes = match output.state {
                 yamux::OutputState::Data(bytes) => bytes,
-                yamux::OutputState::OpenedByRemote => {
-                    // This is a new stream, so add an entry for it.
-                    self.bufs.insert(stream_id, Multistream {
-                        buffer: MultistreamFrameBuffer::new(),
-                        state: MultistreamState::NewIncoming
-                    });
-                },
                 yamux::OutputState::ClosedByRemote => {
                     // Technically the stream may have been "half closed" (ie we can still send but they won't)
                     // or "full closed" (ie they won't send and we aren't allowed to), but I don't think we care
@@ -203,11 +196,12 @@ impl <S: async_stream::AsyncStream> YamuxMultistream<S> {
             };
     
             // Fetch the stream details.
-            // ignore any messages on a stream we don't know about (they could be messages sent after
-            // we sent a close request for instance)
-            let Some(entry) = self.bufs.get_mut(&stream_id) else {
-                continue
-            }
+            let entry = self.bufs.entry(stream_id).or_insert_with(|| {
+                Multistream {
+                    buffer: MultistreamFrameBuffer::new(),
+                    state: MultistreamState::NewIncoming
+                }
+            });
 
             // Feed bytes to the stream buffer, returning multistream frames as they are available.
             let byte_iter = match entry.buffer.feed(bytes) {
