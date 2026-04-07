@@ -8,3 +8,5 @@ snow = { version = "0.10.0", default-features = false, features = ["default-reso
 thiserror = { version = "2.0.18", default-features = false }
 ed25519-dalek = { version = "2", default-features = false, features = ["rand_core"] }
 bs58 = { version = "0.5", default-features = false, features = ["alloc"] }
+# TODO: Remove tracing dependency once debugging is done.
+tracing = { version = "0.1", default-features = false }

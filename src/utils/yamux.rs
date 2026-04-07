@@ -95,7 +95,7 @@ struct StreamState {
 enum BufferedOutboundMessage {
     Open,
     Data(VecDeque<u8>),
-    Close
+    Close,
 }
 
 impl StreamState {
@@ -144,6 +144,7 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
     /// receiver is slow or keeps the window size small on some stream.
     pub fn send_data(&mut self, stream_id: YamuxStreamId, data: impl IntoIterator<Item=u8>) -> Result<(), Error> {
         let Some(stream) = self.streams.get_mut(&stream_id) else {
+            tracing::debug!("[yamux::send_data] stream {} not in self.streams", stream_id);
             return Err(Error::StreamNotFound(stream_id))
         };
 
@@ -155,6 +156,7 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
                 stream.outbound_buf.push_back(BufferedOutboundMessage::Data(data.into_iter().collect()));
             }
             Some(BufferedOutboundMessage::Close) => {
+                tracing::debug!("[yamux::send_data] stream {} has Close in outbound_buf (closed_by_us={})", stream_id, stream.closed_by_us);
                 return Err(Error::StreamNotFound(stream_id))
             }
         }
@@ -165,9 +167,10 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
     /// Schedule the stream to be closed. This waits for any other scheduled data to be
     /// sent before inititating the close. Run [`Self::next()`] to progress this. Until the
     /// close has been enacted, data on this stream may still be emitted.
-    pub fn close_stream(&mut self, stream_id: YamuxStreamId) -> Result<(), Error> {
+    pub fn close_stream(&mut self, stream_id: YamuxStreamId) {
         let Some(stream) = self.streams.get_mut(&stream_id) else {
-            return Err(Error::StreamNotFound(stream_id))
+            // If we can't find the stream, it's been closed anyway.
+            return
         };
 
         if let Some(BufferedOutboundMessage::Close) = stream.outbound_buf.back() {
@@ -175,22 +178,20 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
         } else {
             stream.outbound_buf.push_back(BufferedOutboundMessage::Close);
         }
-        Ok(())
     }
 
     /// Schedule the stream to be closed immediately. This ignores any data scheduled to be sent
     /// and will close the stream as soon as [`Self::next()`] is called. No further data will
     /// be seen for this stream.
-    pub fn close_stream_immediately(&mut self, stream_id: YamuxStreamId) -> Result<(), Error> {
+    pub fn close_stream_immediately(&mut self, stream_id: YamuxStreamId) {
         let Some(stream) = self.streams.get_mut(&stream_id) else {
-            return Err(Error::StreamNotFound(stream_id))
+            // If we can't find the stream, it's been closed anyway.
+            return
         };
 
         stream.outbound_buf.clear();
         stream.outbound_buf.push_back(BufferedOutboundMessage::Close);
         stream.closed_by_us = true;
-
-        Ok(())
     }
 
     /// Drive our session, returning the next chunk of bytes on any given stream.
@@ -284,17 +285,14 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
                         self.inner.write_all(&YamuxHeader::window_update(hdr.stream_id, delta as u32).encode()).await?;
                     }
 
-                    // Read the frame into our buffer and return a reference to the bytes read.
-                    self.inner.read_exact(&mut self.inbound_buf[..data_len]).await?;
-
-                    // If the stream is FIN then we mark that the remote won't send more.
-                    // If the stream is RST then we remove it immediately; they won't send any
-                    // more but they also won't accept any more from us.
-                    // If the stream is SYN then it's just been opened; tell the user this.
                     if hdr.flags.contains(FrameFlag::Rst) {
+                        // If the stream is RST then we remove it immediately; they won't send any
+                        // more but they also won't accept any more from us. We still must return any final data.
                         self.streams.remove(&hdr.stream_id);
                         self.output_buf = Some(InnerOutputState::ClosedByRemote(hdr.stream_id));
                     } else if hdr.flags.contains(FrameFlag::Fin) {
+                        // If the stream is FIN then we mark that the remote won't send more.
+                        // Deliver the data first, then ClosedByRemote on the next call.
                         stream.remote_fin = true;
                         self.output_buf = Some(InnerOutputState::ClosedByRemote(hdr.stream_id));
                     }
