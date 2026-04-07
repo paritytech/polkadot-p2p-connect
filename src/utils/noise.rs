@@ -3,9 +3,10 @@ use alloc::vec;
 use alloc::vec::Vec;
 use crate::PlatformT;
 use crate::utils::async_stream::{self, AsyncStream};
+use crate::utils::protobuf;
 use crate::utils::peer_id::{
     Identity, PeerId,
-    verify_ed25519, NoiseHandshakePayload, NoiseHandshakeFromProtobufError
+    verify_ed25519,
 };
 
 const NOISE_PARAMS: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
@@ -108,6 +109,136 @@ pub async fn handshake_dialer<S: AsyncStream, P: PlatformT>(
     // Transition to transport mode.
     let transport = noise.into_transport_mode()?;
     Ok((NoiseStream::new(stream, transport), remote_peer_id))
+}
+
+// ---------------------------------------------------------------------------
+// Noise handshake
+// ---------------------------------------------------------------------------
+
+/// The noise handshake payload that we send/receive to confirm eachothers identity
+/// and share public keys so that we can generate a shared private key.
+pub struct NoiseHandshakePayload {
+    // An ed25519 public key
+    pub key: [u8; 32],
+    // A signature over a payload against the above key
+    pub signature: [u8; 64],
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum NoiseHandshakeFromProtobufError {
+    #[error("protobuf error decoding noise handshake payload: {0}")]
+    Protobuf(#[from] protobuf::Error),
+    #[error("invalid noise handshake payload, got bytes: {0:?}")]
+    InvalidNoisePayload(Vec<u8>),
+    #[error("invalid key shape in noise handshake payload, got bytes: {0:?}")]
+    InvalidKey(Vec<u8>),
+    #[error("invalid key length in noise handshake payload, got {0} but expected 32")]
+    InvalidKeyLength(usize),
+    #[error("invalid signature length in noise handshake payload, got {0} but expected 64")]
+    InvalidSignatureLength(usize),
+}
+
+impl NoiseHandshakePayload {
+    pub fn to_protobuf(&self, out: &mut [u8]) -> usize {
+        // First, protobuf-encode the 32 byte key.
+        let (encoded_key, encoded_key_len) = {
+            let mut k = [0u8; 128];
+            let len = protobuf::encode(&mut k)
+                .encode_varint(1, 1u8)
+                .encode_data(2, &self.key)
+                .num_encoded();
+            (k, len)
+        };
+
+        // Now encode the outer payload which is the key + signature,
+        // and return the number of bytes we encoded (ie wrote to out)
+        protobuf::encode(out)
+            .encode_data(1, &encoded_key[..encoded_key_len])
+            .encode_data(2, &self.signature)
+            .num_encoded()
+    }
+
+    pub fn from_protobuf(bytes: &[u8]) -> Result<Self, NoiseHandshakeFromProtobufError> {
+        // First we decode the bytes into an identity key and signature.
+        let (key_protobuf, signature) = Self::decode_outer_noise_payload_protobuf(bytes)?;
+
+        // The key is also a protobuf encoded thing from which we
+        // extract the ed25519 key bytes (or error if a different format).
+        let key = Self::decode_ed25519_public_key_protobuf(key_protobuf)?;
+
+        Ok(Self {
+            key,
+            signature,
+        })
+    }
+
+    /// Decode the outermost noise payload message into a protobuf encoded key and a signature.
+    fn decode_outer_noise_payload_protobuf(data: &[u8]) -> Result<(&[u8], [u8; 64]), NoiseHandshakeFromProtobufError> {
+        struct NoiseVisitor<'a> {
+            identity_key: Option<&'a [u8]>,
+            identity_sig: Option<&'a [u8]>,
+        }
+        impl <'input> protobuf::Visitor<'input> for NoiseVisitor<'input> {
+            fn data(&mut self, field_id: u64, bytes: &'input [u8]) {
+                if field_id == 1 {
+                    self.identity_key = Some(bytes);
+                } else if field_id == 2 {
+                    self.identity_sig = Some(bytes)
+                }
+            }
+        }
+    
+        let mut visitor = NoiseVisitor { identity_key: None, identity_sig: None };
+        protobuf::decode(&mut &*data, &mut visitor)?;
+    
+        let signature: [u8; 64] = if let Some(sig_bytes) = visitor.identity_sig {
+            sig_bytes.try_into().map_err(|_| NoiseHandshakeFromProtobufError::InvalidSignatureLength(sig_bytes.len()))?
+        } else {
+            return Err(NoiseHandshakeFromProtobufError::InvalidNoisePayload(data.to_vec()))
+        };
+
+        let key: &[u8] = if let Some(key_bytes) = visitor.identity_key {
+            key_bytes
+        } else {
+            return Err(NoiseHandshakeFromProtobufError::InvalidNoisePayload(data.to_vec()))
+        };
+
+        Ok((key, signature))
+    }
+
+    /// Decode a protobuf encoded `PublicKey`, returning the raw 32-byte Ed25519 key.
+    fn decode_ed25519_public_key_protobuf(data: &[u8]) -> Result<[u8; 32], NoiseHandshakeFromProtobufError> {
+        struct KeyVisitor<'a> {
+            ty: Option<u64>,
+            value: Option<&'a [u8]>
+        }
+        impl <'input> protobuf::Visitor<'input> for KeyVisitor<'input> {
+            fn varint(&mut self, field_id: u64, n: u64) {
+                if field_id == 1 {
+                    self.ty = Some(n);
+                }
+            } 
+            fn data(&mut self, field_id: u64, bytes: &'input [u8]) {
+                if field_id == 2 {
+                    self.value = Some(bytes);
+                }
+            }
+        }
+
+        let mut visitor = KeyVisitor { ty: None, value: None };
+        protobuf::decode(&mut &*data, &mut visitor)?;
+
+        let (Some(1), Some(key_data)) = (visitor.ty, visitor.value) else {
+            return Err(NoiseHandshakeFromProtobufError::InvalidKey(data.to_vec()))
+        };
+        if key_data.len() != 32 {
+            return Err(NoiseHandshakeFromProtobufError::InvalidKeyLength(key_data.len()));
+        }
+
+        let mut out = [0u8; 32];
+        out.copy_from_slice(key_data);
+        Ok(out)
+    }
 }
 
 // ---------------------------------------------------------------------------
