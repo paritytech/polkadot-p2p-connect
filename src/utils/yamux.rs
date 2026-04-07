@@ -304,7 +304,8 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
                         self.output_buf = Some(InnerOutputState::ClosedByRemote(stream_id));
                     }
 
-                    // If no data was actually given then just loop around.
+                    // Optimisation: if no data in this frame then just ignore it and loop.
+                    // No data will not allow the layer above to progress anyway.
                     if data_len == 0 {
                         continue
                     }

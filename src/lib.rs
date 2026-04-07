@@ -227,6 +227,7 @@ impl <Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
         identity_secret: Option<[u8; 32]>,
         remote_peer_id: Option<PeerId>
     ) -> Result<Self, ConnectionError> {
+        // TODO: Make these configurable.
         const NEGOTIATE_TIMEOUT_MS: usize = 10_000;
         const NOISE_HANDSHAKE_TIMEOUT_MS: usize = 30_000;
 

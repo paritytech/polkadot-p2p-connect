@@ -6,7 +6,7 @@ use crate::utils::yamux::{self, YamuxSession};
 use crate::utils::{async_stream, varint};
 use alloc::collections::{BTreeMap, VecDeque};
 use core::mem;
-use frame_buffer::{MultistreamFrameBuffer, MultistreamFrameBufferOutput};
+use frame_buffer::MultistreamFrameBuffer;
 
 const LOG_TARGET: &str = "yamux_multistream";
 
@@ -19,6 +19,9 @@ const MULTISTREAM_PROTOCOL_NAME_WITH_NEWLINE: &[u8] = b"/multistream/1.0.0\n";
 pub struct YamuxMultistream<S> {
     inner: YamuxSession<S>,
     bufs: BTreeMap<YamuxStreamId, Multistream>,
+    // If this is set, we should drain messages from here before we
+    // read more data from the network:
+    read_from_stream_buffer: Option<YamuxStreamId>,
 }
 
 pub struct Output {
@@ -38,12 +41,13 @@ pub enum OutputState {
     Closed,
 }
 
+#[derive(Debug)]
 struct Multistream {
     buffer: MultistreamFrameBuffer,
     state: MultistreamState
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum MultistreamState {
     NewIncoming,
     NewIncomingProtocol,
@@ -80,6 +84,7 @@ impl <S: async_stream::AsyncStream> YamuxMultistream<S> {
         Self {
             inner: yamux_session,
             bufs: BTreeMap::new(),
+            read_from_stream_buffer: None,
         }
     }
 
@@ -179,50 +184,64 @@ impl <S: async_stream::AsyncStream> YamuxMultistream<S> {
 
     async fn next_inner(&mut self) -> Result<Option<Output>, Error> {
         loop {
-            // Get the next output from some yamux stream.
-            let output = match self.inner.next().await {
-                Some(Ok(out)) => out,
-                Some(Err(e)) => return Err(Error::Yamux(e)),
-                None => return Ok(None)
+            // If we have recently taken some bytes in on a stream, we try to parse/drain more messages
+            // from the same buffer until it's empty. Else, we ask for more bytes from our Yamux layer below.
+            let (stream_id, entry) = if let Some(stream_id) = self.read_from_stream_buffer.take() {
+                let entry = self
+                    .bufs
+                    .get_mut(&stream_id)
+                    .expect("stream must exist");
+                (stream_id, entry)
+            } else {
+                let output = match self.inner.next().await {
+                    Some(Ok(out)) => out,
+                    Some(Err(e)) => return Err(Error::Yamux(e)),
+                    None => return Ok(None)
+                };
+
+                let stream_id = output.stream_id;
+                let bytes = match output.state {
+                    yamux::OutputState::Data(bytes) => {
+                        bytes
+                    },
+                    yamux::OutputState::ClosedByRemote => {
+                        tracing::debug!(target: LOG_TARGET, "stream {stream_id} closed by remote");
+                        // Technically the stream may have been "half closed" (ie we can still send but they won't)
+                        // or "full closed" (ie they won't send and we aren't allowed to), but I don't think we care
+                        // here we so we just keep it simple and close all or nothing.
+                        self.bufs.remove(&stream_id);
+                        return Ok(Some(Output { stream_id, state: OutputState::Closed }));
+                    },
+                };
+        
+                // Fetch the stream details.
+                let entry = self.bufs.entry(stream_id).or_insert_with(|| {
+                    Multistream {
+                        buffer: MultistreamFrameBuffer::new(),
+                        state: MultistreamState::NewIncoming
+                    }
+                });
+
+                // Feed bytes to our message buffer.
+                entry.buffer.feed(bytes);
+                (stream_id, entry)
             };
 
-            let stream_id = output.stream_id;
-            let bytes = match output.state {
-                yamux::OutputState::Data(bytes) => {
-                    bytes
-                },
-                yamux::OutputState::ClosedByRemote => {
-                    tracing::debug!(target: LOG_TARGET, "stream {stream_id} closed by remote");
-                    // Technically the stream may have been "half closed" (ie we can still send but they won't)
-                    // or "full closed" (ie they won't send and we aren't allowed to), but I don't think we care
-                    // here we so we just keep it simple and close all or nothing.
-                    self.bufs.remove(&stream_id);
-                    return Ok(Some(Output { stream_id, state: OutputState::Closed }));
-                },
-            };
-    
-            // Fetch the stream details.
-            let entry = self.bufs.entry(stream_id).or_insert_with(|| {
-                Multistream {
-                    buffer: MultistreamFrameBuffer::new(),
-                    state: MultistreamState::NewIncoming
-                }
-            });
-
-            // Feed bytes to the stream buffer, returning multistream frames as they are available.
-            let byte_iter = match entry.buffer.feed(bytes) {
-                MultistreamFrameBufferOutput::Ready(iter) => {
+            // Pull the next message from the message buffer, looping if nothing ready yet.
+            let byte_iter = match entry.buffer.next() {
+                Some(Ok(iter)) => {
+                    // We've seen a message! This means there could be other messages
+                    // to follow. So, set `read_from_stream_buffer` to ensure that, if
+                    // this is the case, we will read them all before taking more input
+                    // from the network.
+                    self.read_from_stream_buffer = Some(stream_id);
                     iter
                 },
-                MultistreamFrameBufferOutput::NeedsMoreBytes => {
-                    continue
-                },
-                MultistreamFrameBufferOutput::VarintOutOfRange => {
-                    return Err(Error::VarintOutOfRange)
-                },
+                Some(Err(_)) => return Err(Error::VarintOutOfRange),
+                None => continue 
             };
 
-            // Handle the bytes depending on the stream state.
+            // Handle the message depending on the stream state.
             match &mut entry.state {
                 // New incoming stream, so do the initial multistream protocol handshake.
                 MultistreamState::NewIncoming => {

@@ -15,15 +15,9 @@ pub struct MultistreamFrameBuffer {
     failed: bool,
 }
 
-/// The output from calling [`MultistreamState::feed()`]
-pub enum MultistreamFrameBufferOutput<BytesIter> {
-    // Ready with the bytes for the next multistream frame.
-    Ready(BytesIter),
-    // Need more btyes before we can hand a frame back.
-    NeedsMoreBytes,
-    // Failed to decode the varint for a frame; no more progress can be made.
-    VarintOutOfRange,
-}
+#[derive(Debug, thiserror::Error)]
+#[error("varint out of range")]
+pub struct Error;
 
 #[derive(Debug, Clone, Copy)]
 enum MultistreamFrameBufferNeeds {
@@ -46,15 +40,16 @@ impl MultistreamFrameBuffer {
         }
     }
 
-    /// Hand some bytes to this buffer. If we have enough bytes to
-    /// hand back the next multistream frame then we hand it back,
-    /// else give None back (we'll need more bytes).
-    pub fn feed(&mut self, bytes: &[u8]) -> MultistreamFrameBufferOutput<impl ExactSizeIterator<Item=u8>> {
-        if self.failed {
-            return MultistreamFrameBufferOutput::VarintOutOfRange
-        }
-
+    /// Hand some bytes to this buffer.
+    pub fn feed(&mut self, bytes: &[u8]) {
         self.buf.extend(bytes);
+    }
+
+    /// Advance the state of the internal buffer, handing back messages once they are available.
+    pub fn next(&mut self) -> Option<Result<impl ExactSizeIterator<Item=u8>, Error>> {
+        if self.failed {
+            return Some(Err(Error))
+        }
 
         loop {
             match self.needs {
@@ -62,7 +57,7 @@ impl MultistreamFrameBuffer {
                 // byte from the input.
                 MultistreamFrameBufferNeeds::DecodingLen(decoder) => {
                     let Some(byte) = self.buf.pop_front() else {
-                        return MultistreamFrameBufferOutput::NeedsMoreBytes;
+                        return None
                     };
                     match decoder.feed(byte) {
                         varint::DecoderOutput::Value(len) => {
@@ -71,10 +66,10 @@ impl MultistreamFrameBuffer {
                         },
                         varint::DecoderOutput::NeedsMoreBytes(d) => {
                             self.needs = MultistreamFrameBufferNeeds::DecodingLen(d);
-                            return MultistreamFrameBufferOutput::NeedsMoreBytes;
+                            return None
                         },
                         varint::DecoderOutput::OutOfRange => {
-                            return MultistreamFrameBufferOutput::VarintOutOfRange;
+                            return Some(Err(Error))
                         }
                     }
                 },
@@ -85,9 +80,9 @@ impl MultistreamFrameBuffer {
                     if self.buf.len() >= len {
                         let iter = self.buf.drain(0..len);
                         self.needs = MultistreamFrameBufferNeeds::default();
-                        return MultistreamFrameBufferOutput::Ready(iter)
+                        return Some(Ok(iter))
                     } else {
-                        return MultistreamFrameBufferOutput::NeedsMoreBytes
+                        return None
                     }
                 }
             }
