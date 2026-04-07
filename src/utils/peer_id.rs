@@ -180,53 +180,76 @@ pub fn verify_ed25519(pubkey: &[u8; 32], message: &[u8], signature: &[u8; 64]) -
 // PeerId (a representation of a public key)
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, thiserror::Error)]
+pub enum PeerIdFromBase58Error {
+    #[error("peer ID does not seem to be an ed25519 key")]
+    NotEd25519,
+    #[error("base58 decode error: {0:?}")]
+    Base58(bs58::decode::Error),
+    #[error("expected key length {expected} but got {actual}")]
+    WrongLength { expected: usize, actual: usize },
+    #[error("cannot decode varint: {0}")]
+    CannotDecodeVarint(varint::Error),
+}
+
+/// The expected length of a PeerId in bytes.
+const PEER_ID_LEN: usize = 38;
+
 /// A libp2p PeerId — the multihash of a protobuf-encoded public key.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PeerId {
-    multihash: Vec<u8>,
+    multihash: [u8; PEER_ID_LEN],
 }
 
 impl PeerId {
     // Take an ed25519 public key and convert it to a PeerId.
     pub (crate) fn from_ed25519_public_key(key: [u8; 32]) -> Self {
-        let mut multihash = Vec::with_capacity(36);
-        multihash.push(0x00);
+        let mut buf = [0u8; PEER_ID_LEN];
 
-        // Encode the length of the protobuf ed25519 key, which is 36:
-        // - 1 byte: field 1, type varint.
-        //   - 1 byte: field 1 value: 1u8.
-        // - 1 byte: field 2, type data.
-        //   - 1 byte: field 2 data length (32).
-        //   - 32 bytes: field 2 data (key bytes).
-        // See decode_ed25519_public_key_protobuf which follows this.
-        varint::encode_to_vec(36, &mut multihash);
+        // 0x00 is an Identity type (for ed25519 keys).
+        buf[0] = 0x00;
 
-        let mut buf = [0u8; 36];
-        let n = protobuf::encode(&mut buf)
+        // Now we varint encode the length of the key (36).
+        varint::encode(36, &mut buf[1..]);
+
+        // Now we protobuf encode the key.
+        protobuf::encode(&mut buf[2..])
             .encode_varint(1, 1u8)
             .encode_data(2, &key)
             .num_encoded();
-        multihash.extend_from_slice(&buf[..n]);
 
-        PeerId { multihash }
+        PeerId { multihash: buf }
     }
 
     /// Parse a PeerId from a base58-encoded string (as found in multiaddrs).
-    pub fn from_base58(s: &str) -> Result<Self, bs58::decode::Error> {
-        let bytes = bs58::decode(s).into_vec()?;
+    pub fn from_base58(s: &str) -> Result<Self, PeerIdFromBase58Error> {
+        let mut buf = [0u8; PEER_ID_LEN];
+        let num_bytes_decoded = bs58::decode(s)
+            .onto(&mut buf)
+            .map_err(PeerIdFromBase58Error::Base58)?;
 
-        //// TODO: Validate multihash structure: code (varint) + length (varint) + digest
-        // {
-        //     let cursor = &mut &*bytes;
-        //     let code = varint::decode(cursor)?;
-        //     let digest_len = varint::decode(cursor)?;
-        //     // The remaining bytes should equal the length.
-        //     if cursor.len() != digest_len {
-        //         // TODO: Validate
-        //     }
-        // }
+        if num_bytes_decoded != PEER_ID_LEN {
+            return Err(PeerIdFromBase58Error::WrongLength { expected: PEER_ID_LEN, actual: num_bytes_decoded })
+        }
 
-        Ok(PeerId { multihash: bytes })
+        // Validate multihash structure (see encoding above).
+        {
+            let cursor: &mut &[u8] = &mut &buf[..];
+
+            // Hash function code: only 0x00 (identity) is valid for Ed25519 PeerIds.
+            let code = varint::decode(cursor).map_err(PeerIdFromBase58Error::CannotDecodeVarint)?;
+            if code != 0x00 {
+                return Err(PeerIdFromBase58Error::NotEd25519);
+            }
+
+            // Length of the remaining bytes must be 36.
+            let digest_len = varint::decode(cursor).map_err(PeerIdFromBase58Error::CannotDecodeVarint)?;
+            if cursor.len() != 36 && digest_len != 36 {
+                return Err(PeerIdFromBase58Error::WrongLength { expected: 36, actual: cursor.len() })
+            }
+        }
+
+        Ok(PeerId { multihash: buf })
     }
 
     /// Convert a [`PeerId`] to a base58 string.
