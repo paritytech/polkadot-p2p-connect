@@ -93,6 +93,7 @@ pub struct Decoder {
 }
 
 /// Output from [`Decoder::feed`].
+#[derive(Debug)]
 pub enum DecoderOutput {
     Value(u64),
     NeedsMoreBytes(Decoder),
@@ -135,5 +136,137 @@ impl Decoder {
             value |= byte_val << (idx * 7)
         }
         value
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use alloc::vec;
+
+    // Known unsigned varint (LEB128) encodings.
+    const KNOWN_ENCODINGS: &[(u64, &[u8])] = &[
+        (0, &[0x00]),
+        (1, &[0x01]),
+        (127, &[0x7F]),
+        (128, &[0x80, 0x01]),
+        (255, &[0xFF, 0x01]),
+        (300, &[0xAC, 0x02]),
+        (16384, &[0x80, 0x80, 0x01]),
+        (u64::MAX, &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]),
+    ];
+
+    #[test]
+    fn encode_known_values() {
+        for &(value, expected) in KNOWN_ENCODINGS {
+            let mut buf = [0u8; 10];
+            let n = encode(value, &mut buf);
+            assert_eq!(&buf[..n], expected, "encoding {value}");
+        }
+    }
+
+    #[test]
+    fn decode_known_values() {
+        for &(expected, bytes) in KNOWN_ENCODINGS {
+            let mut cursor = bytes;
+            let value = decode(&mut cursor).unwrap();
+            assert_eq!(value, expected, "decoding {expected}");
+            assert!(cursor.is_empty(), "all bytes consumed for {expected}");
+        }
+    }
+
+    #[test]
+    fn encode_to_vec_matches_encode() {
+        for &(value, expected) in KNOWN_ENCODINGS {
+            let mut vec = Vec::new();
+            encode_to_vec(value, &mut vec);
+            assert_eq!(&vec, expected, "encode_to_vec for {value}");
+        }
+    }
+
+    #[test]
+    fn encode_to_vec_appends() {
+        let mut vec = vec![0xAA, 0xBB];
+        encode_to_vec(300, &mut vec);
+        assert_eq!(vec, &[0xAA, 0xBB, 0xAC, 0x02]);
+    }
+
+    #[test]
+    fn encode_returns_correct_length() {
+        let mut buf = [0u8; 10];
+        assert_eq!(encode(0, &mut buf), 1);
+        assert_eq!(encode(127, &mut buf), 1);
+        assert_eq!(encode(128, &mut buf), 2);
+        assert_eq!(encode(16383, &mut buf), 2);
+        assert_eq!(encode(16384, &mut buf), 3);
+        assert_eq!(encode(u64::MAX, &mut buf), 10);
+    }
+
+    #[test]
+    fn decode_advances_cursor_past_varint_only() {
+        // Put a varint followed by trailing bytes; cursor should stop after the varint.
+        let bytes = &[0xAC, 0x02, 0xFF, 0xFF];
+        let mut cursor = &bytes[..];
+        let value = decode(&mut cursor).unwrap();
+        assert_eq!(value, 300);
+        assert_eq!(cursor, &[0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn decode_multiple_varints_from_one_slice() {
+        let mut buf = Vec::new();
+        encode_to_vec(1, &mut buf);
+        encode_to_vec(300, &mut buf);
+        encode_to_vec(u64::MAX, &mut buf);
+
+        let mut cursor = &buf[..];
+        assert_eq!(decode(&mut cursor).unwrap(), 1);
+        assert_eq!(decode(&mut cursor).unwrap(), 300);
+        assert_eq!(decode(&mut cursor).unwrap(), u64::MAX);
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn decode_empty_input() {
+        let mut cursor: &[u8] = &[];
+        let err = decode(&mut cursor).unwrap_err();
+        assert!(matches!(err, Error::UnexpectedEndOfInput));
+    }
+
+    #[test]
+    fn decode_truncated_input() {
+        // 0x80 has continuation bit set but no following byte.
+        let mut cursor: &[u8] = &[0x80];
+        let err = decode(&mut cursor).unwrap_err();
+        assert!(matches!(err, Error::UnexpectedEndOfInput));
+    }
+
+    #[test]
+    fn decode_out_of_range() {
+        // 11 bytes all with continuation bit set; exceeds 10-byte buffer.
+        let bytes = [0x80u8; 11];
+        let mut cursor = &bytes[..];
+        let err = decode(&mut cursor).unwrap_err();
+        assert!(matches!(err, Error::OutOfRange));
+    }
+
+    #[test]
+    fn decoder_overflow_returns_out_of_range() {
+        // Feed 10 continuation bytes, then one more should trigger OutOfRange.
+        let mut decoder = Decoder::new();
+        for _ in 0..10 {
+            match decoder.feed(0x80) {
+                DecoderOutput::NeedsMoreBytes(d) => decoder = d,
+                other => panic!("expected NeedsMoreBytes, got {other:?}"),
+            }
+        }
+        assert!(matches!(decoder.feed(0x80), DecoderOutput::OutOfRange));
+    }
+
+    #[test]
+    #[should_panic]
+    fn encode_panics_on_small_buffer() {
+        let mut buf = [0u8; 1];
+        encode(128, &mut buf); // needs 2 bytes
     }
 }
