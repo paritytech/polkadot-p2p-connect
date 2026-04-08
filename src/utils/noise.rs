@@ -247,8 +247,10 @@ impl NoiseHandshakePayload {
 // ---------------------------------------------------------------------------
 
 async fn send_frame(stream: &mut impl AsyncStream, data: &[u8]) -> Result<(), async_stream::Error> {
-    stream.write_all(&(data.len() as u16).to_be_bytes()).await?;
-    stream.write_all(data).await?;
+    let mut buf = [0u8; MAX_NOISE_MSG + 2];
+    buf[..2].copy_from_slice(&(data.len() as u16).to_be_bytes());
+    buf[2..data.len() + 2].copy_from_slice(data);
+    stream.write_all(&buf[.. data.len() + 2]).await?;
     Ok(())
 }
 
@@ -273,8 +275,7 @@ pub struct NoiseStream<S> {
     inner: S,
     transport: snow::TransportState,
     /// Buffer of decrypted plaintext not yet consumed by the caller.
-    read_buf: Vec<u8>,
-    read_pos: usize,
+    read_buf: VecDeque<u8>,
 }
 
 impl<S> NoiseStream<S> {
@@ -282,44 +283,42 @@ impl<S> NoiseStream<S> {
         Self {
             inner,
             transport,
-            read_buf: Vec::new(),
-            read_pos: 0,
+            read_buf: VecDeque::new(),
         }
     }
 }
 
 impl<S: AsyncStream> AsyncStream for NoiseStream<S> {
     async fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), async_stream::Error> {
-        let mut filled = 0;
-        while filled < buf.len() {
-            // Drain buffered plaintext first.
-            if self.read_pos < self.read_buf.len() {
-                let avail = self.read_buf.len() - self.read_pos;
-                let n = avail.min(buf.len() - filled);
-                buf[filled..filled + n]
-                    .copy_from_slice(&self.read_buf[self.read_pos..self.read_pos + n]);
-                self.read_pos += n;
-                filled += n;
-                if self.read_pos == self.read_buf.len() {
-                    self.read_buf.clear();
-                    self.read_pos = 0;
+        let mut buf_pos: usize = 0;
+        while buf_pos < buf.len() {
+            if !self.read_buf.is_empty() {
+                //// Drain bytes from our internal buffer first.
+                
+                // How many bytes to read from our buffer?
+                let n = usize::min(self.read_buf.len(), buf.len() - buf_pos);
+                
+                // Drain these bytes and push to the buffer
+                for (i, b) in self.read_buf.drain(..n).enumerate() {
+                    buf[buf_pos + i] = b;
                 }
-                continue;
+                
+                buf_pos += n;
+            } else {
+                //// If the internal buffer is empty then read another frame on the wire.
+                
+                // Read a frame.                
+                let mut encrypted_buf = [0u8; MAX_NOISE_MSG];
+                let frame_len = recv_frame(&mut self.inner, &mut encrypted_buf).await?;
+
+                // Decrypt them via snow
+                let mut decrypted_buf = [0u8; MAX_NOISE_MSG];
+                let decrypted_len = self.transport.read_message(&encrypted_buf[..frame_len], &mut decrypted_buf)
+                    .map_err(async_stream::Error::read_exact)?;
+
+                // Push them to our buffer
+                self.read_buf.extend(decrypted_buf[..decrypted_len].iter().copied());
             }
-
-            // Read the next Noise frame from the wire.
-            let mut len_buf = [0u8; 2];
-            self.inner.read_exact(&mut len_buf).await?;
-            let frame_len = u16::from_be_bytes(len_buf) as usize;
-
-            let mut encrypted = vec![0u8; frame_len];
-            self.inner.read_exact(&mut encrypted).await?;
-
-            let mut decrypt_buf = vec![0u8; frame_len];
-            let decrypted_len = self.transport.read_message(&encrypted, &mut decrypt_buf)
-                .map_err(async_stream::Error::read_exact)?;
-            self.read_buf = decrypt_buf[..decrypted_len].to_vec();
-            self.read_pos = 0;
         }
         Ok(())
     }
@@ -327,12 +326,12 @@ impl<S: AsyncStream> AsyncStream for NoiseStream<S> {
     async fn write_all(&mut self, data: &[u8]) -> Result<(), async_stream::Error> {
         let mut encrypt_buf = [0u8; MAX_NOISE_MSG];
         for chunk in data.chunks(MAX_PLAINTEXT) {
+            // Encrypt each outgoing message.
             let encrypted_len = self.transport.write_message(chunk, &mut encrypt_buf[..])
                 .map_err(async_stream::Error::write_all)?;
-            let mut frame = Vec::with_capacity(2 + encrypted_len);
-            frame.extend_from_slice(&(encrypted_len as u16).to_be_bytes());
-            frame.extend_from_slice(&encrypt_buf[..encrypted_len]);
-            self.inner.write_all(&frame).await?;
+
+            // And then send it.
+            send_frame(&mut self.inner, &encrypt_buf[..encrypted_len]).await?;
         }
         Ok(())
     }
