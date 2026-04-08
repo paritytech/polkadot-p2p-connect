@@ -194,5 +194,42 @@ mod test {
         }
     }
 
-    
+    #[test]
+    fn verify_ed25519_valid_signature() {
+        let identity = Identity::from_random_bytes([42u8; 32]);
+        let message = b"hello world";
+        let signature = identity.sign(message);
+        let pubkey = identity.public_key_bytes();
+
+        assert!(verify_ed25519(&pubkey, message, &signature));
+    }
+
+    #[test]
+    fn verify_ed25519_wrong_message() {
+        let identity = Identity::from_random_bytes([42u8; 32]);
+        let signature = identity.sign(b"hello world");
+        let pubkey = identity.public_key_bytes();
+
+        assert!(!verify_ed25519(&pubkey, b"wrong message", &signature));
+    }
+
+    #[test]
+    fn verify_ed25519_wrong_key() {
+        let identity = Identity::from_random_bytes([42u8; 32]);
+        let other = Identity::from_random_bytes([99u8; 32]);
+        let message = b"hello world";
+        let signature = identity.sign(message);
+
+        assert!(!verify_ed25519(&other.public_key_bytes(), message, &signature));
+    }
+
+    #[test]
+    fn verify_ed25519_tampered_signature() {
+        let identity = Identity::from_random_bytes([42u8; 32]);
+        let message = b"hello world";
+        let mut signature = identity.sign(message);
+        signature[0] ^= 0xff;
+
+        assert!(!verify_ed25519(&identity.public_key_bytes(), message, &signature));
+    }
 }

@@ -1,6 +1,7 @@
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
+use alloc::collections::VecDeque;
 use crate::PlatformT;
 use crate::utils::async_stream::{self, AsyncStream};
 use crate::utils::protobuf;
@@ -371,5 +372,279 @@ impl snow::resolvers::CryptoResolver for CryptoResolver {
     }
     fn resolve_cipher(&self, choice: &snow::params::CipherChoice) -> Option<Box<dyn snow::types::Cipher>> {
         snow::resolvers::DefaultResolver.resolve_cipher(choice)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// Minimal single-threaded executor for tests.
+    /// All our mock I/O completes immediately, so Pending is never expected.
+    fn block_on<F: core::future::Future>(f: F) -> F::Output {
+        use core::task::{Context, Poll, Waker};
+        use alloc::task::Wake;
+        use alloc::sync::Arc;
+        use core::pin::pin;
+
+        struct NoopWaker;
+        impl Wake for NoopWaker {
+            fn wake(self: Arc<Self>) {}
+        }
+
+        let waker = Waker::from(Arc::new(NoopWaker));
+        let mut cx = Context::from_waker(&waker);
+        let mut f = pin!(f);
+        match f.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => v,
+            Poll::Pending => panic!("future returned Pending in mock-I/O test"),
+        }
+    }
+
+    /// In-memory byte buffer implementing AsyncStream.
+    /// Writes append; reads consume from the front.
+    struct MockStream {
+        buf: Vec<u8>,
+        read_pos: usize,
+    }
+
+    impl MockStream {
+        fn new() -> Self {
+            Self { buf: Vec::new(), read_pos: 0 }
+        }
+        fn from_bytes(bytes: Vec<u8>) -> Self {
+            Self { buf: bytes, read_pos: 0 }
+        }
+    }
+
+    impl AsyncStream for MockStream {
+        async fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), async_stream::Error> {
+            let available = self.buf.len() - self.read_pos;
+            if available < buf.len() {
+                return Err(async_stream::Error::read_exact(MockStreamError));
+            }
+            buf.copy_from_slice(&self.buf[self.read_pos..self.read_pos + buf.len()]);
+            self.read_pos += buf.len();
+            Ok(())
+        }
+        async fn write_all(&mut self, data: &[u8]) -> Result<(), async_stream::Error> {
+            self.buf.extend_from_slice(data);
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct MockStreamError;
+    impl core::fmt::Display for MockStreamError {
+        fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+            f.write_str("mock stream: not enough data")
+        }
+    }
+    impl core::error::Error for MockStreamError {}
+
+    /// Simple test RNG: fills bytes from an atomic counter.
+    /// Not cryptographically secure, but sufficient for Noise handshake tests.
+    fn test_fill_random(bytes: &mut [u8]) {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(1);
+        for b in bytes.iter_mut() {
+            *b = CTR.fetch_add(7, Ordering::Relaxed) as u8;
+        }
+    }
+
+    fn test_resolver() -> CryptoResolver {
+        CryptoResolver(test_fill_random)
+    }
+
+    /// Perform a Noise XX handshake entirely in memory and return a
+    /// (initiator, responder) pair of `TransportState`s ready for data.
+    fn make_transport_pair() -> (snow::TransportState, snow::TransportState) {
+        let params: snow::params::NoiseParams = NOISE_PARAMS.parse().unwrap();
+
+        let builder_i = snow::Builder::with_resolver(
+            params.clone(), Box::new(test_resolver()),
+        );
+        let kp_i = builder_i.generate_keypair().unwrap();
+        let mut initiator = snow::Builder::with_resolver(
+            params.clone(), Box::new(test_resolver()),
+        )
+            .local_private_key(&kp_i.private)
+            .unwrap()
+            .build_initiator()
+            .unwrap();
+
+        let builder_r = snow::Builder::with_resolver(
+            params.clone(), Box::new(test_resolver()),
+        );
+        let kp_r = builder_r.generate_keypair().unwrap();
+        let mut responder = snow::Builder::with_resolver(
+            params, Box::new(test_resolver()),
+        )
+            .local_private_key(&kp_r.private)
+            .unwrap()
+            .build_responder()
+            .unwrap();
+
+        let mut buf = [0u8; MAX_NOISE_MSG];
+
+        // -> e
+        let len = initiator.write_message(&[], &mut buf).unwrap();
+        let msg1 = buf[..len].to_vec();
+        let mut tmp = [0u8; MAX_NOISE_MSG];
+        responder.read_message(&msg1, &mut tmp).unwrap();
+
+        // <- e, ee, s, es
+        let len = responder.write_message(&[], &mut buf).unwrap();
+        let msg2 = buf[..len].to_vec();
+        let mut tmp = [0u8; MAX_NOISE_MSG];
+        initiator.read_message(&msg2, &mut tmp).unwrap();
+
+        // -> s, se
+        let len = initiator.write_message(&[], &mut buf).unwrap();
+        let msg3 = buf[..len].to_vec();
+        let mut tmp = [0u8; MAX_NOISE_MSG];
+        responder.read_message(&msg3, &mut tmp).unwrap();
+
+        (
+            initiator.into_transport_mode().unwrap(),
+            responder.into_transport_mode().unwrap(),
+        )
+    }
+
+    #[test]
+    fn round_trip_small_message() {
+        let (ti, tr) = make_transport_pair();
+
+        let plaintext = b"hello, noise!";
+        let mut writer = NoiseStream::new(MockStream::new(), ti);
+        block_on(writer.write_all(plaintext)).unwrap();
+
+        let wire = writer.inner.buf.clone();
+        let mut reader = NoiseStream::new(MockStream::from_bytes(wire), tr);
+
+        let mut out = vec![0u8; plaintext.len()];
+        block_on(reader.read_exact(&mut out)).unwrap();
+        assert_eq!(&out, plaintext);
+    }
+
+    #[test]
+    fn round_trip_exact_max_plaintext() {
+        let (ti, tr) = make_transport_pair();
+
+        let plaintext: Vec<u8> = (0..MAX_PLAINTEXT).map(|i| (i % 256) as u8).collect();
+        let mut writer = NoiseStream::new(MockStream::new(), ti);
+        block_on(writer.write_all(&plaintext)).unwrap();
+
+        let wire = writer.inner.buf.clone();
+        let mut reader = NoiseStream::new(MockStream::from_bytes(wire), tr);
+
+        let mut out = vec![0u8; plaintext.len()];
+        block_on(reader.read_exact(&mut out)).unwrap();
+        assert_eq!(out, plaintext);
+    }
+
+    #[test]
+    fn round_trip_spans_multiple_frames() {
+        let (ti, tr) = make_transport_pair();
+
+        // Exceeds MAX_PLAINTEXT, so writer must produce 2 Noise frames.
+        let plaintext: Vec<u8> = (0..(MAX_PLAINTEXT + 100)).map(|i| (i % 256) as u8).collect();
+        let mut writer = NoiseStream::new(MockStream::new(), ti);
+        block_on(writer.write_all(&plaintext)).unwrap();
+
+        let wire = writer.inner.buf.clone();
+        let mut reader = NoiseStream::new(MockStream::from_bytes(wire), tr);
+
+        let mut out = vec![0u8; plaintext.len()];
+        block_on(reader.read_exact(&mut out)).unwrap();
+        assert_eq!(out, plaintext);
+    }
+
+    #[test]
+    fn partial_reads_drain_buffer_correctly() {
+        let (ti, tr) = make_transport_pair();
+
+        let plaintext = b"abcdefghij"; // 10 bytes in one frame
+        let mut writer = NoiseStream::new(MockStream::new(), ti);
+        block_on(writer.write_all(plaintext)).unwrap();
+
+        let wire = writer.inner.buf.clone();
+        let mut reader = NoiseStream::new(MockStream::from_bytes(wire), tr);
+
+        // Read 4 bytes (leaves 6 buffered)
+        let mut first = [0u8; 4];
+        block_on(reader.read_exact(&mut first)).unwrap();
+        assert_eq!(&first, b"abcd");
+
+        // Read remaining 6 bytes from the internal buffer (no new frame read)
+        let mut second = [0u8; 6];
+        block_on(reader.read_exact(&mut second)).unwrap();
+        assert_eq!(&second, b"efghij");
+    }
+
+    #[test]
+    fn multiple_writes_then_single_read() {
+        let (ti, tr) = make_transport_pair();
+
+        let mut writer = NoiseStream::new(MockStream::new(), ti);
+        block_on(writer.write_all(b"first")).unwrap();
+        block_on(writer.write_all(b"second")).unwrap();
+        block_on(writer.write_all(b"third")).unwrap();
+
+        let wire = writer.inner.buf.clone();
+        let mut reader = NoiseStream::new(MockStream::from_bytes(wire), tr);
+
+        // 5 + 6 + 5 = 16 bytes total across three frames, read all at once
+        let mut out = vec![0u8; 16];
+        block_on(reader.read_exact(&mut out)).unwrap();
+        assert_eq!(&out, b"firstsecondthird");
+    }
+
+    #[test]
+    fn read_spanning_frame_boundary() {
+        let (ti, tr) = make_transport_pair();
+
+        let mut writer = NoiseStream::new(MockStream::new(), ti);
+        block_on(writer.write_all(b"AAA")).unwrap(); // frame 1: 3 bytes
+        block_on(writer.write_all(b"BBBBB")).unwrap(); // frame 2: 5 bytes
+
+        let wire = writer.inner.buf.clone();
+        let mut reader = NoiseStream::new(MockStream::from_bytes(wire), tr);
+
+        // Read 5 bytes: spans frame 1 (3 bytes) then starts frame 2 (2 bytes)
+        let mut out = [0u8; 5];
+        block_on(reader.read_exact(&mut out)).unwrap();
+        assert_eq!(&out, b"AAABB");
+
+        // Read remaining 3 bytes from frame 2's buffer
+        let mut out = [0u8; 3];
+        block_on(reader.read_exact(&mut out)).unwrap();
+        assert_eq!(&out, b"BBB");
+    }
+
+    #[test]
+    fn encrypted_bytes_differ_from_plaintext() {
+        let (ti, _tr) = make_transport_pair();
+
+        let plaintext = b"this should be encrypted on the wire";
+        let mut writer = NoiseStream::new(MockStream::new(), ti);
+        block_on(writer.write_all(plaintext)).unwrap();
+
+        // Skip the 2-byte length prefix; the encrypted payload must not contain
+        // the plaintext substring.
+        let payload = &writer.inner.buf[2..];
+        assert!(!payload.windows(plaintext.len()).any(|w| w == plaintext));
+    }
+
+    #[test]
+    fn empty_write_produces_no_output() {
+        let (ti, _tr) = make_transport_pair();
+
+        let mut writer = NoiseStream::new(MockStream::new(), ti);
+        block_on(writer.write_all(b"")).unwrap();
+
+        // chunks(MAX_PLAINTEXT) on an empty slice yields no chunks,
+        // so nothing should be written to the inner stream.
+        assert!(writer.inner.buf.is_empty());
     }
 }
