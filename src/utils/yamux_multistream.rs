@@ -200,30 +200,32 @@ impl <S: async_stream::AsyncStream> YamuxMultistream<S> {
                 };
 
                 let stream_id = output.stream_id;
-                let bytes = match output.state {
+                let entry = match output.state {
+                    yamux::OutputState::OpenedByRemote => {
+                        self.bufs.entry(stream_id).or_insert_with(|| Multistream { 
+                            buffer: MultistreamFrameBuffer::new(), 
+                            state: MultistreamState::NewIncoming 
+                        })
+                    },
                     yamux::OutputState::Data(bytes) => {
-                        bytes
+                        let Some(entry) = self.bufs.get_mut(&stream_id) else { continue };
+                        entry.buffer.feed(bytes);
+                        entry
                     },
                     yamux::OutputState::ClosedByRemote => {
                         tracing::debug!(target: LOG_TARGET, "stream {stream_id} closed by remote");
-                        // Technically the stream may have been "half closed" (ie we can still send but they won't)
-                        // or "full closed" (ie they won't send and we aren't allowed to), but I don't think we care
-                        // here we so we just keep it simple and close all or nothing.
-                        self.bufs.remove(&stream_id);
-                        return Ok(Some(Output { stream_id, state: OutputState::Closed }));
+                        // Only emit a `Closed` message if this stream progressed far enough to
+                        // actually emit some other message (eg OutputState::IncomingProtocol). If it
+                        // didn't get this far then nothing knows about it yet anyway.
+                        if let Some(removed) = self.bufs.remove(&stream_id) 
+                        && !matches!(removed.state, MultistreamState::NewIncoming | MultistreamState::NewIncomingProtocol) {
+                            return Ok(Some(Output { stream_id, state: OutputState::Closed }));
+                        } else {
+                            continue
+                        }
                     },
                 };
-        
-                // Fetch the stream details.
-                let entry = self.bufs.entry(stream_id).or_insert_with(|| {
-                    Multistream {
-                        buffer: MultistreamFrameBuffer::new(),
-                        state: MultistreamState::NewIncoming
-                    }
-                });
 
-                // Feed bytes to our message buffer.
-                entry.buffer.feed(bytes);
                 (stream_id, entry)
             };
 

@@ -215,6 +215,11 @@ impl FrameFlags {
     pub fn empty() -> Self {
         FrameFlags(0)
     }
+    pub fn is_open_new_stream(&self) -> bool {
+        self.contains(FrameFlag::Syn)
+        && !self.contains(FrameFlag::Rst)
+        && !self.contains(FrameFlag::Fin)
+    }
     pub fn contains(&self, flag: FrameFlag) -> bool {
         self.0 & (flag as u16) == (flag as u16)
     }

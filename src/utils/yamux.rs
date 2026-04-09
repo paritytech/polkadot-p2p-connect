@@ -76,6 +76,8 @@ pub struct Output<'a> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutputState<'a> {
+    /// This stream was opened by the remote.
+    OpenedByRemote,
     /// Some data was received on this stream. It may be a new stream.
     Data(&'a [u8]),
     /// This stream was closed by the remote.
@@ -83,6 +85,7 @@ pub enum OutputState<'a> {
 }
 
 enum InnerOutputState {
+    OpenedByRemote(YamuxStreamId),
     Data(YamuxStreamId, usize),
     ClosedByRemote(YamuxStreamId),
 }
@@ -215,6 +218,10 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
         res.transpose().map(|res| {
             res.map(|inner_state| {
                 match inner_state {
+                    InnerOutputState::OpenedByRemote(id) => Output {
+                        stream_id: id,
+                        state: OutputState::OpenedByRemote,
+                    },
                     InnerOutputState::ClosedByRemote(id) => Output {
                         stream_id: id,
                         state: OutputState::ClosedByRemote,
@@ -265,17 +272,18 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
                     // need to drain these bytes else we'll be out of sync for the next loop.
                     self.inner.read_exact(&mut self.inbound_buf[..data_len]).await?;
 
-                    // If new stream, negotiate and loop if it was rejected.
-                    if flags.contains(FrameFlag::Syn) && !self.negotiate_new_stream_request(&hdr).await? {
-                        continue
-                    }
-
-                    // Get stream details. If not found then it may be a bad sender but may also be
-                    // that we have closed the stream recently. If remote_fin was sent then we should
-                    // definitely get no more data on it.
-                    let Some(stream) = self.streams.get_mut(&stream_id) else {
+                    // Get hold of the stream details, opening a new stream if we need to.
+                    let (stream, is_new) = if flags.is_open_new_stream() {
+                        let Some(stream) = self.negotiate_new_stream_request(&hdr).await? else { continue };
+                        (stream, true)
+                    } else if let Some(stream) = self.streams.get_mut(&stream_id) {
+                        (stream, false)
+                    } else {
                         continue
                     };
+
+                    // If they sent Fin then error. If we closed then we'll remove later, but ignore
+                    // anything else immediately.
                     if stream.remote_fin {
                         return Err(Error::DataSentAfterFin(stream_id));
                     }
@@ -283,16 +291,8 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
                         continue
                     }
 
-                    // We don't care if they send more bytes than our window size, but we do ensure the window
-                    // size is always at least MAX_FRAME_SIZE and so if their window size gets to 1/2 then
-                    // bump it up so that they keep sending.
+                    // Decrement the receive window given the data.
                     stream.recv_window = stream.recv_window.saturating_sub(data_len);
-                    if stream.recv_window < MAX_FRAME_SIZE / 2 {
-                        let delta = MAX_FRAME_SIZE - stream.recv_window;
-                        tracing::debug!(target: LOG_TARGET, "sending WINDOW UPDATE on stream {stream_id}: +{delta}");
-                        self.inner.write_all(&YamuxHeader::window_update(stream_id, delta as u32).encode()).await?;
-                        stream.recv_window += delta;
-                    }
 
                     if flags.contains(FrameFlag::Rst) {
                         // If the stream is RST then we remove it immediately; they won't send any
@@ -304,36 +304,41 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
                         // Deliver the data first, then ClosedByRemote on the next call.
                         stream.remote_fin = true;
                         self.output_buf = Some(InnerOutputState::ClosedByRemote(stream_id));
+                    } else if stream.recv_window < MAX_FRAME_SIZE / 2 {
+                        // We don't care if they send more bytes than our window size, but we do ensure the window
+                        // size is always at least MAX_FRAME_SIZE and so if their window size gets to 1/2 then
+                        // bump it up so that they keep sending.
+                        let delta = MAX_FRAME_SIZE - stream.recv_window;
+                        stream.recv_window += delta;
+                        tracing::debug!(target: LOG_TARGET, "sending WINDOW UPDATE on stream {stream_id}: +{delta}");
+                        self.inner.write_all(&YamuxHeader::window_update(stream_id, delta as u32).encode()).await?;
                     }
 
-                    // Optimisation: if no data in this frame then just ignore it and loop.
-                    // No data will not allow the layer above to progress anyway.
-                    if data_len == 0 {
-                        continue
+                    if is_new {
+                        // If the stream is new, we need to send an Opened message before any data.
+                        // The stream will never be "new" AND FIN/RST so we'll buffer max 1 message.
+                        self.output_buf = Some(InnerOutputState::Data(stream_id, data_len));
+                        return Ok(Some(InnerOutputState::OpenedByRemote(stream_id)));
+                    } else {
+                        // If the stream is not new, just return the data now and any buffered messages
+                        // (close related ones) will return right after.
+                        return Ok(Some(InnerOutputState::Data(stream_id, data_len)));
                     }
-                    return Ok(Some(InnerOutputState::Data(stream_id, data_len)))
                 },
                 FrameType::WindowUpdate => {
                     tracing::debug!(target: LOG_TARGET, "received WINDOW UPDATE on stream {stream_id} (flags: {flags}, delta: {length})");
 
-                    // If the stream is RST then we remove all knowledge of it as it is closed.
-                    // It doesn't matter what the window update header says.
-                    if flags.contains(FrameFlag::Rst) {
-                        self.streams.remove(&stream_id);
-                        return Ok(Some(InnerOutputState::ClosedByRemote(stream_id)))
-                    }
-
-                    // If new stream, negotiate and loop if it was rejected.
-                    if flags.contains(FrameFlag::Syn) && !self.negotiate_new_stream_request(&hdr).await? {
-                        continue
-                    }
-
-                    // Get stream details. The stream may have been closed, so just drain the relevant bytes
-                    // and ignore this message for now.
-                    let Some(stream) = self.streams.get_mut(&stream_id) else {
-                        self.drain_bytes_from_stream(hdr.length as usize).await?;
+                    // Get hold of the stream details, opening a new stream if we need to.
+                    let (stream, is_new) = if flags.is_open_new_stream() {
+                        let Some(stream) = self.negotiate_new_stream_request(&hdr).await? else { continue };
+                        (stream, true)
+                    } else if let Some(stream) = self.streams.get_mut(&stream_id) {
+                        (stream, false)
+                    } else {
                         continue
                     };
+
+                    // Ignore/don't emit any messages if we closed the stream already.
                     if stream.closed_by_us {
                         continue
                     }
@@ -341,12 +346,21 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
                     // Update stream window size.
                     stream.send_window = stream.send_window.saturating_add(hdr.length as usize);
 
-                    // If FIN was sent then they won't send more so we acknowledge,
-                    // but we'll still accept window updates and can send to them.
-                    // If the stream is SYN then it's just been opened; tell the user this.
-                    if flags.contains(FrameFlag::Fin) {
+                    if flags.contains(FrameFlag::Rst) {
+                        // If the stream is RST then we remove all knowledge of it as it is closed.
+                        // It doesn't matter what the window update header says.
+                        self.streams.remove(&stream_id);
+                        return Ok(Some(InnerOutputState::ClosedByRemote(stream_id)))
+                    } else if flags.contains(FrameFlag::Fin) {
+                        // If FIN was sent then they won't send more so we acknowledge,
+                        // but we'll still accept window updates and can send to them.
+                        // If the stream is SYN then it's just been opened; tell the user this.
                         stream.remote_fin = true;
                         return Ok(Some(InnerOutputState::ClosedByRemote(stream_id)))
+                    } else if is_new {
+                        // This is a new stream, so emit a message that it is opened. New streams
+                        // will never conflict with RST/FIN flags.
+                        return Ok(Some(InnerOutputState::OpenedByRemote(stream_id)))
                     }
                 },
                 FrameType::Ping => {
@@ -460,7 +474,7 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
     /// - If this returns false, then we can ignore this frame and loop around to the next. This code will
     ///   consume any data from the rejected frame if necessary.
     /// - If this returns an error, then we are done and should stop immediately.
-    async fn negotiate_new_stream_request(&mut self, hdr: &YamuxHeader) -> Result<bool, Error> {
+    async fn negotiate_new_stream_request(&mut self, hdr: &YamuxHeader) -> Result<Option<&mut StreamState>, Error> {
         let stream_id = hdr.stream_id;
 
         // they should always send even stream ID numbers, and not the session ID number.
@@ -474,7 +488,7 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
         if self.streams.len() > MAX_STREAMS {
             self.inner.write_all(&YamuxHeader::reject_stream(stream_id).encode()).await?;
             tracing::debug!(target: LOG_TARGET, "rejecting incoming stream {stream_id}: too many open streams");
-            return Ok(false)
+            return Ok(None)
         }
 
         // If they send a duplicate stream ID, that is a protocol error so bail.
@@ -485,31 +499,10 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
         }
 
         // All good; accept new stream. Don't process any data etc; that's for the main loop.
-        self.inner.write_all(&YamuxHeader::accept_stream(stream_id).encode()).await?;
-        self.streams.insert(stream_id, StreamState::new());
-
         tracing::debug!(target: LOG_TARGET, "accepting incoming stream {stream_id}");
-        Ok(true)
-    }
+        self.inner.write_all(&YamuxHeader::accept_stream(stream_id).encode()).await?;
 
-    /// Drains the given number of bytes from the stream, discarding them.
-    async fn drain_bytes_from_stream(&mut self, mut remaining: usize) -> Result<(), Error> {
-        const MAX_DRAIN_BUF_SIZE: usize = 32 * 1024;
-        let mut buf = [0u8; MAX_DRAIN_BUF_SIZE];
-
-        while remaining > 0 {
-            // drain via the stack while we can:
-            if remaining >= MAX_DRAIN_BUF_SIZE {
-                self.inner.read_exact(&mut buf).await?;
-                remaining -= MAX_DRAIN_BUF_SIZE;
-            } else {
-                let mut buf = vec![0u8; remaining];
-                self.inner.read_exact(&mut buf).await?;
-                remaining = 0;
-            }
-        }
-
-        Ok(())
+        Ok(Some(self.streams.entry(stream_id).or_insert_with(StreamState::new)))
     }
 }
 
@@ -546,6 +539,7 @@ mod test {
         }
     }
 
+    /// Poll the [`YamuxSession`], expecting it to return an [`Output`].
     fn next_expecting_output<S: AsyncStream>(yamux: &mut YamuxSession<S>) -> Output<'_> {
         block_on(yamux.next())
             .expect("expecting Ready, not Pending, from YamuxSession::next()")
@@ -553,6 +547,7 @@ mod test {
             .expect("output should not be Err")
     }
 
+    /// Read a Yamux header from the [`MockStreamHandle`], consuming the bytes.
     fn read_header(handle: &mut MockStreamHandle) -> YamuxHeader {
         YamuxHeader::decode(&handle.drain(YamuxHeader::SIZE).try_into().unwrap()).unwrap()
     }
@@ -718,13 +713,7 @@ mod test {
         // Open a stream first.
         handle.extend(YamuxHeader::open_stream(YamuxStreamId::new(2)).encode());
 
-        // Provide data on the stream so the open is processed.
-        let data = b"x";
-        handle.extend(YamuxHeader::send_data(YamuxStreamId::new(2), data.len() as u32).encode());
-        handle.extend(data.iter().copied());
-
-        let res = next_expecting_output(&mut yamux);
-        assert_eq!(res.state, OutputState::Data(data));
+        assert!(block_on(yamux.next()).is_none());
 
         // Now send a WindowUpdate with FIN.
         let header = YamuxHeader {
