@@ -189,10 +189,12 @@ impl <S: async_stream::AsyncStream> YamuxMultistream<S> {
             // If we have recently taken some bytes in on a stream, we try to parse/drain more messages
             // from the same buffer until it's empty. Else, we ask for more bytes from our Yamux layer below.
             let (stream_id, entry) = if let Some(stream_id) = self.read_from_stream_buffer.take() {
-                let entry = self
+                // We may try to rea from a stream that was closed already due to an invalid
+                // message or something, so ignore and loop if stream isn't found
+                let Some(entry) = self
                     .bufs
-                    .get_mut(&stream_id)
-                    .expect("stream must exist");
+                    .get_mut(&stream_id) else { continue };
+
                 (stream_id, entry)
             } else {
                 let output = match self.inner.next().await {
@@ -402,9 +404,9 @@ fn bytes_equal_iter(value: &[u8], iter: impl ExactSizeIterator<Item=u8>) -> bool
 #[cfg(test)]
 mod test {
     use super::*;
+    use alloc::vec;
     use crate::utils::testing::{block_on, MockStream, MockStreamHandle};
-    use crate::AsyncStream;
-    use crate::layers::yamux::header::{ FrameFlags, YamuxHeader };
+    use crate::layers::yamux::header::{ FrameType, YamuxHeader };
     
     fn yamux_multistream() -> (YamuxMultistream<MockStream>, MockStreamHandle) {
         let stream = MockStream::new();
@@ -417,10 +419,19 @@ mod test {
         handle.extend(YamuxHeader::open_stream(YamuxStreamId::new(n)).encode());
     }
 
-    fn send_data<'a>(handle: &mut MockStreamHandle, n: u32, bytes: impl IntoIterator<Item=&'a u8>) {
-        let bytes: Vec<u8> = bytes.into_iter().copied().collect();
-        handle.extend(YamuxHeader::send_data(YamuxStreamId::new(n), bytes.len() as u32).encode());
-        handle.extend(bytes);
+    /// Send some multistream frames (which will be prefixed with their varint length) in a yamux data frame.
+    fn send_data<'a>(handle: &mut MockStreamHandle, n: u32, messages: &[&[u8]]) {
+        // First encode our messages so that we know the yamux frame length
+        let mut data = Vec::new();
+        for msg in messages {
+            varint::encode_to_vec(msg.len() as u64, &mut data);
+            data.extend(*msg);
+        }
+
+        // Now, push a yamux frame with the correct data length
+        handle.extend(YamuxHeader::send_data(YamuxStreamId::new(n), data.len() as u32).encode());
+        // Then push the data
+        handle.extend(data);
     }
 
     fn next_expecting_output(yamux: &mut YamuxMultistream<MockStream>) -> Output {
@@ -430,19 +441,254 @@ mod test {
             .expect("output should not be Err")
     }
 
+    fn next_yamux_header(handle: &mut MockStreamHandle) -> YamuxHeader {
+        YamuxHeader::decode(&handle.drain(YamuxHeader::SIZE).try_into().unwrap()).unwrap()
+    }
+
+    fn next_multistream_frames(handle: &mut MockStreamHandle) -> impl Iterator<Item=Vec<u8>> {
+        let header = YamuxHeader::decode(&handle.drain(YamuxHeader::SIZE).try_into().unwrap()).unwrap();
+        if header.frame_type != FrameType::Data {
+            // Skip over non-data frames.
+            return next_multistream_frames(handle)
+        }
+
+        // Maybe multiple multistream frames in one yamux frame, so return
+        // an iterator over all of them.
+        let mut data = handle.drain(header.length as usize);
+        core::iter::from_fn(move || {
+            // Nothing left to iterate.
+            if data.is_empty() {
+                return None
+            }
+
+            // Decode multistream frame length
+            let data_cursor = &mut &*data;
+            let multistream_len = match varint::decode(data_cursor) {
+                Ok(len) => len as usize,
+                Err(e) => panic!("Could not decode mulitstream varint: {e}. Data: {data:?}")
+            };
+    
+            // Take this frame and keep the rest
+            let output = data_cursor[..multistream_len].to_vec();
+            data = data_cursor[multistream_len..].to_vec();
+            
+            Some(output)
+        })
+    }
+
     #[test]
     fn accept_new_stream() {
+        // tracing_subscriber::fmt().with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG).init();
         let (mut stream, mut handle) = yamux_multistream();
 
+        // First the remote proposes a new protocol on some stream:
         open_stream(&mut handle, 2);
-        send_data(&mut handle, 2, b"/multistream/1.0.0\n/foo/bar\n");
-
+        send_data(&mut handle, 2, &[b"/multistream/1.0.0\n", b"/foo/bar\n"]);
         assert_eq!(
             next_expecting_output(&mut stream), 
             Output { 
                 stream_id: YamuxStreamId::new(2), 
-                state: OutputState::IncomingProtocol("/foo/bar\n".into())
+                state: OutputState::IncomingProtocol("/foo/bar".into())
             }
         );
+
+        // We accept!
+        stream.accept_protocol(YamuxStreamId::new(2)).unwrap();
+        block_on(stream.next());
+
+        // Now the remote should receive an accept message.
+        let frames: Vec<_> = next_multistream_frames(&mut handle).collect();
+        assert_eq!(
+            frames,
+            vec![
+                b"/multistream/1.0.0\n".to_vec(), 
+                b"/foo/bar\n".to_vec(),
+            ]
+        );
+
+        // The remote now can send some data.
+        send_data(&mut handle, 2, &[b"hello world", b"and more"]);
+
+        // We should now receive it unchanged.
+        assert_eq!(
+            next_expecting_output(&mut stream), 
+            Output { 
+                stream_id: YamuxStreamId::new(2), 
+                state: OutputState::Data(b"hello world".to_vec())
+            }
+        );
+        assert_eq!(
+            next_expecting_output(&mut stream), 
+            Output { 
+                stream_id: YamuxStreamId::new(2), 
+                state: OutputState::Data(b"and more".to_vec())
+            }
+        );
+    }
+
+    #[test]
+    fn reject_new_stream_and_then_accept_next_proposal() {
+        // tracing_subscriber::fmt().with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG).init();
+        let (mut stream, mut handle) = yamux_multistream();
+
+        // First the remote proposes a new protocol on some stream:
+        open_stream(&mut handle, 2);
+        send_data(&mut handle, 2, &[b"/multistream/1.0.0\n", b"/foo/bar\n"]);
+        assert_eq!(
+            next_expecting_output(&mut stream), 
+            Output { 
+                stream_id: YamuxStreamId::new(2), 
+                state: OutputState::IncomingProtocol("/foo/bar".into())
+            }
+        );
+
+        // We reject the protocol.
+        stream.reject_protocol(YamuxStreamId::new(2)).unwrap();
+        block_on(stream.next());
+
+        // Now the remote should receive a reject message.
+        let frames: Vec<_> = next_multistream_frames(&mut handle).collect();
+        assert_eq!(
+            frames,
+            vec![
+                b"/multistream/1.0.0\n".to_vec(), 
+                b"na\n".to_vec(),
+            ]
+        );
+
+        // The remote can propose a new protocol
+        send_data(&mut handle, 2, &[b"/foo/wibble\n"]);
+        assert_eq!(
+            next_expecting_output(&mut stream), 
+            Output { 
+                stream_id: YamuxStreamId::new(2), 
+                state: OutputState::IncomingProtocol("/foo/wibble".into())
+            }
+        );
+
+        // We can then accept it
+        stream.accept_protocol(YamuxStreamId::new(2)).unwrap();
+        block_on(stream.next());
+
+        // Now the remote should receive an accept message.
+        let frames: Vec<_> = next_multistream_frames(&mut handle).collect();
+        assert_eq!(
+            frames,
+            vec![b"/foo/wibble\n".to_vec()]
+        );
+    }
+
+    #[test]
+    fn reject_invalid_multistream_header() {
+        //tracing_subscriber::fmt().with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG).init();
+        let (mut stream, mut handle) = yamux_multistream();
+
+        // The remote proposes a new protocol on some stream, but using an invalid header
+        open_stream(&mut handle, 2);
+        send_data(&mut handle, 2, &[b"/multistream/z.z.z\n", b"/foo/bar\n"]);
+
+        // We see nothing back (but drive progress)
+        assert!(block_on(stream.next()).is_none());
+
+        // The remote gets an ack to acknowledge the new stream,
+        // then a window update header,
+        // then a close because invalid header.
+        assert_eq!(
+            next_yamux_header(&mut handle),
+            YamuxHeader::accept_stream(YamuxStreamId::new(2))
+        );
+        next_yamux_header(&mut handle);
+        assert_eq!(
+            next_yamux_header(&mut handle),
+            YamuxHeader::reject_stream(YamuxStreamId::new(2))
+        );
+    }
+
+    #[test]
+    fn accepts_large_payloads_split_across_yamux_frames() {
+        //tracing_subscriber::fmt().with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG).init();
+        let (mut stream, mut handle) = yamux_multistream();
+
+        // Open and accept a stream first. This all tested so keep it brief.
+        open_stream(&mut handle, 2);
+        send_data(&mut handle, 2, &[b"/multistream/1.0.0\n", b"/foo/bar\n"]);
+        next_expecting_output(&mut stream); // IncomintProtocol
+        stream.accept_protocol(YamuxStreamId::new(2)).unwrap();
+        block_on(stream.next()); // Drive things forward after accept
+        let _ = next_multistream_frames(&mut handle); // Pull accept frames.
+
+        // First, build our data packet. a varint at the front and then 10MB of 123u8.
+        let mut data = vec![];
+        let ten_mb = 10 * 1024 * 1024;
+        varint::encode_to_vec(ten_mb, &mut data);
+        for _ in 0..ten_mb {
+            data.push(123u8);
+        }
+
+        // Now, chunk and send this as many yamux frames
+        for bytes in data.chunks(10 * 1024) {
+            handle.extend(YamuxHeader::send_data(YamuxStreamId::new(2), bytes.len() as u32).encode());
+            handle.extend(bytes.iter().copied());
+        }
+
+        // The next message we get back should be this single large data packet
+        assert_eq!(
+            next_expecting_output(&mut stream),
+            Output {
+                stream_id: YamuxStreamId::new(2),
+                state: OutputState::Data(vec![123u8; 10 * 1024 * 1024])
+            }
+        );
+    }
+
+    #[test]
+    fn sends_large_payloads_split_across_yamux_frames() {
+        //tracing_subscriber::fmt().with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG).init();
+        let (mut stream, mut handle) = yamux_multistream();
+
+        // Open and accept a stream first. This all tested so keep it brief.
+        open_stream(&mut handle, 2);
+        send_data(&mut handle, 2, &[b"/multistream/1.0.0\n", b"/foo/bar\n"]);
+        next_expecting_output(&mut stream); // IncomintProtocol
+        stream.accept_protocol(YamuxStreamId::new(2)).unwrap();
+        block_on(stream.next()); // Drive things forward after accept
+        let _ = next_multistream_frames(&mut handle); // Pull accept frames.
+
+        // Send 10MB of data to the remote.
+        let ten_mb = 10 * 1024 * 1024usize;
+        stream.send_data(YamuxStreamId::new(2), &vec![123u8; ten_mb]).unwrap();
+        block_on(stream.next());
+
+        // Queue a bunch of window updates to be applied as they are needed. Each adds just 10kb
+        for _ in 0..2000 {
+            handle.extend(YamuxHeader::window_update(YamuxStreamId::new(2), 10 * 1024).encode());
+        }
+
+        // Take yamux data frames from the output, appending them together
+        // and driving the stream as needed to absorb new window updates to
+        // allow progress to continue.
+        let mut response = vec![];
+        let mut frame_count = 0usize;
+        while response.len() < ten_mb {
+            let header = next_yamux_header(&mut handle);
+
+            assert_eq!(header.frame_type, FrameType::Data, "frame {frame_count} should be a Data frame");
+            assert_eq!(header.stream_id, YamuxStreamId::new(2), "frame {frame_count} should be on stream 2");
+
+            let data_segment = handle.drain(header.length as usize);
+            response.extend_from_slice(&data_segment);
+
+            // We'll hit times where we need window updates; this allows
+            // such progress to be made, since we buffered a bunch up to
+            // be consumed above.
+            block_on(stream.next());
+            frame_count += 1;
+        }
+
+        // Now decode the length from the response and check everything matches.
+        let cursor = &mut &*response;
+        let len = varint::decode(cursor).expect("valid varint");
+        assert_eq!(len, ten_mb as u64, "length should be 10MB");
+        assert_eq!(*cursor, vec![123u8; ten_mb], "data should match input");
     }
 }

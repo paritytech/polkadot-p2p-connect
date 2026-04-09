@@ -12,6 +12,7 @@ use header::{
 use alloc::vec;
 use crate::utils::async_stream;
 use alloc::collections::{BTreeMap, VecDeque};
+use alloc::boxed::Box;
 
 // Re-export types in the API
 pub use header::{
@@ -63,7 +64,9 @@ pub struct YamuxSession<S> {
     inner: S,
     next_stream_id: YamuxStreamId,
     streams: BTreeMap<YamuxStreamId, StreamState>,
-    inbound_buf: [u8; MAX_FRAME_SIZE],
+    // This could be on the stack but we want it to be MAX_FRAME_SIZE (ie 512kb)
+    // in length so box it to reduce the chance of stack overflows.
+    inbound_buf: Box<[u8]>,
     failed: bool,
     output_buf: Option<InnerOutputState>,
 }
@@ -127,7 +130,10 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
             inner: stream,
             next_stream_id: YamuxStreamId::first(),
             streams: BTreeMap::new(),
-            inbound_buf: [0u8; MAX_FRAME_SIZE],
+            // We rely on the compiler eliding the stack allocating and allocating
+            // directly on the heap here to avoid possible stack overflows, but this
+            // seems to be the case.
+            inbound_buf: Box::new([0u8; MAX_FRAME_SIZE]),
             failed: false,
             output_buf: None,
         }
@@ -455,6 +461,10 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
                         self.inner.write_all(&YamuxHeader::send_data(stream_id, b_len as u32).encode()).await?;
                         self.inner.write_all(&b[..b_len]).await?;
                     }
+
+                    // Decrement the send window. When this runs out we'll be forced to
+                    // wait for a window update from them before we can send more.
+                    stream.send_window = stream.send_window.saturating_sub(bytes_to_send);
         
                     // If we didn't send all of the bytes, then drain what we did send and put
                     // the message back onto the queue to be tried again later.
@@ -537,11 +547,32 @@ mod test {
         YamuxHeader::decode(&handle.drain(YamuxHeader::SIZE).try_into().unwrap()).unwrap()
     }
 
+    fn yamux_session() -> (YamuxSession<MockStream>, MockStreamHandle) {
+        let stream = MockStream::new();
+        let handle = stream.handle();
+        let yamux = YamuxSession::new(stream);
+        (yamux, handle)
+    }
+
+    #[test]
+    fn stack_overflows_avoided() {
+        let y = || {
+            let (s, _) = yamux_session();
+            s
+        };
+        // 20 of these on the stack should be ok. We have this test because
+        // it's easily possible to have large stack buffers to handle everything,
+        // and this was causing issues earlier so we allocate a bit more to the heap.
+        let _: [YamuxSession<MockStream>; _] = [
+            y(), y(), y(), y(), y(), y(), y(), y(), y(), y(),
+            y(), y(), y(), y(), y(), y(), y(), y(), y(), y(),
+        ];
+    }
+
     #[test]
     fn new_streams_can_be_opened() {
         let stream = MockStream::new();
         let mut handle = stream.handle();
-
         let mut yamux = YamuxSession::new(stream);
 
         // Open, then send data.
@@ -572,7 +603,6 @@ mod test {
     fn new_streams_can_be_opened_with_data() {
         let stream = MockStream::new();
         let mut handle = stream.handle();
-
         let mut yamux = YamuxSession::new(stream);
 
         // Open and send data in one frame
