@@ -1,3 +1,6 @@
+#[cfg(test)]
+pub mod header;
+#[cfg(not(test))]
 mod header;
 
 use header::{

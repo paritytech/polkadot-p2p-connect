@@ -24,11 +24,13 @@ pub struct YamuxMultistream<S> {
     read_from_stream_buffer: Option<YamuxStreamId>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Output {
     pub stream_id: YamuxStreamId,
     pub state: OutputState
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutputState {
     IncomingProtocol(String),
     OutgoingRejected,
@@ -400,6 +402,47 @@ fn bytes_equal_iter(value: &[u8], iter: impl ExactSizeIterator<Item=u8>) -> bool
 #[cfg(test)]
 mod test {
     use super::*;
-
+    use crate::utils::testing::{block_on, MockStream, MockStreamHandle};
+    use crate::AsyncStream;
+    use crate::layers::yamux::header::{ FrameFlags, YamuxHeader };
     
+    fn yamux_multistream() -> (YamuxMultistream<MockStream>, MockStreamHandle) {
+        let stream = MockStream::new();
+        let handle = stream.handle();
+        let yamux = YamuxSession::new(stream);
+        (YamuxMultistream::new(yamux), handle)
+    }
+
+    fn open_stream(handle: &mut MockStreamHandle, n: u32) {
+        handle.extend(YamuxHeader::open_stream(YamuxStreamId::new(n)).encode());
+    }
+
+    fn send_data<'a>(handle: &mut MockStreamHandle, n: u32, bytes: impl IntoIterator<Item=&'a u8>) {
+        let bytes: Vec<u8> = bytes.into_iter().copied().collect();
+        handle.extend(YamuxHeader::send_data(YamuxStreamId::new(n), bytes.len() as u32).encode());
+        handle.extend(bytes);
+    }
+
+    fn next_expecting_output(yamux: &mut YamuxMultistream<MockStream>) -> Output {
+        block_on(yamux.next())
+            .expect("expecting Ready, not Pending, from YamuxMultistream::next()")
+            .expect("output should not be None")
+            .expect("output should not be Err")
+    }
+
+    #[test]
+    fn accept_new_stream() {
+        let (mut stream, mut handle) = yamux_multistream();
+
+        open_stream(&mut handle, 2);
+        send_data(&mut handle, 2, b"/multistream/1.0.0\n/foo/bar\n");
+
+        assert_eq!(
+            next_expecting_output(&mut stream), 
+            Output { 
+                stream_id: YamuxStreamId::new(2), 
+                state: OutputState::IncomingProtocol("/foo/bar\n".into())
+            }
+        );
+    }
 }
