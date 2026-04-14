@@ -13,13 +13,119 @@ use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, vec_deque::VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::pin::Pin;
 use core::future::Future;
 use core::marker::PhantomData;
+use core::time::Duration;
+use core::usize;
 use layers::{
     multistream, noise, yamux,
     yamux_multistream::{self, YamuxStreamId},
 };
 use utils::peer_id;
+use alloc::sync::Arc;
+use utils::opaque_id::OpaqueId;
+use utils::sync_or_async_fn::SyncOrAyncFn;
+
+/*
+
+// Define protocols:
+
+let ping = RequestResponseConfig::new("/ipfs/ping/1.0.0")
+    .allow_inbound(true)
+    .with_timeout(timeout)
+    .with_max_size(size)
+    .with_response(|request| request); // if present then this would be elided from events entirely
+
+let kad = RequestResponseConfig::new("/kad/1.0.0")
+    .allow_inbound(false);
+
+let blocks = NotificationConfig::new("/blocks/1.0.0", our_handshake)
+    .allow_inbound(false)
+    .with_timeout(timeout)
+    .with_max_size(size)
+    .with_handshake_verification(|handshake| true);
+
+let warp_sync = RequestResponseConfig::new("/kad/1.0.0");
+
+// Make configuration
+
+let mut config = Configuration::new()
+    .with_identity(...)
+    .with_noise_timeout(10000);
+
+let ping_id = config.add_protocol(ping);
+let kad_id = config.add_protocol(kad);
+let blocks_id = config.add_protocol(blocks);
+let warp_id = config.add_protocol(warp_sync);
+
+// We can add middleware that reacts / consumes events
+config.add_handler(async |event| {
+    // return event:
+    Some(event)
+    // filter event:
+    None
+})
+
+// Connect to peers from configuration
+
+let peer = Connection::new(&config, peer).await?;
+
+let request_id = peer.request(ping_id, b"hello");
+let sub_id = peer.subscribe(blocks_id);
+
+match peer.next().await? {
+    // Handle responses to requests:
+    Message::Response {
+        protocol_id: warp_id,
+        request_id,
+        response
+    } => {
+        // handle warp response
+    },
+    Message::Response {
+        protocol_id: ping_id,
+        request_id,
+        response
+    } => {
+        // handle ping responses
+    },
+
+    // Handle incoming requests:
+    Message::Request {
+        protocol_id: ping_id,
+        request_id,
+        request
+    } => {
+        // echo back request to respond to ping.
+        peer.respond(request_id, request)
+    },
+
+    // Handle notification items
+    Message::Notification {
+        protocol_id: blocks_id,
+        subscription_id,
+        response,
+    } => {
+        // handle incoming block header 
+    }
+
+    // Handle incoming subscription requests
+    Message::Subscribe {
+        protocol_id: blocks_id,
+        subscription_id,
+        handshake
+    } => {
+        peer.accept_subscription(subscription_id);
+        // or
+        peer.reject_subscription(subscription_id);
+        // or verify handshake fn provided so this is done automatically
+        // then periodically:
+        peer.send_message(subscription_id, bytes);
+    }
+}
+
+*/
 
 // Re-export anything that is part of the public APIs.
 pub use crate::error::{ConnectionError, ProtocolError, StreamError};
@@ -36,9 +142,183 @@ pub trait PlatformT {
     fn fill_with_random_bytes(bytes: &mut [u8]);
     /// Returns Err(()) if the given future times out, else returns the output from the future.
     fn timeout<F: core::future::Future<Output = R>, R>(
-        ms: usize,
+        duration: Duration,
         fut: F,
     ) -> impl Future<Output = Result<R, ()>>;
+}
+
+// -----------------------------------------------------------
+// Define the supported protocols
+// -----------------------------------------------------------
+
+/// This is implemented for [`RequestResponseProtocol`] and [`SubscriptionProtocol`], to
+/// allow them to be used in [`Configuration::add_protocol`]. It cannot be implemented by
+/// others as it references private types.
+#[allow(private_interfaces)]
+pub trait Protocol {
+    /// The unique ID type for this protocol. [`RequestResponseProtocol`]
+    /// and [`SubscriptionProtocol`] have different ID types to prevent
+    /// their IDs from being used in the wrong contexts.
+    type Id: From<OpaqueId>;
+
+    /// Convert our different protocols into a unified type that we can
+    /// pass to the configuration.
+    fn into_any_protocol(self) -> AnyProtocol;
+}
+
+#[derive(Debug, Clone)]
+enum AnyProtocol {
+    RequestResponse(RequestResponseProtocol),
+    Subscription(SubscriptionProtocol),
+}
+
+/// Define a "request-response" protocol using this. "request-response" protocols
+/// entail one side making a single request containing some payload, and the other
+/// side returning a single response on the same substream.
+#[derive(Debug, Clone)]
+pub struct RequestResponseProtocol {
+    name: String,
+    allow_inbound: bool,
+    timeout: Duration,
+    max_response_size_in_bytes: usize,
+}
+
+impl RequestResponseProtocol {
+    /// Create a new [`RequestResponseProtocol`], providing the 
+    /// multistream protocol name that it will match on.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            allow_inbound: false,
+            timeout: Duration::from_secs(u64::MAX),
+            max_response_size_in_bytes: usize::MAX,
+        }
+    }
+
+    /// Allow inbound connections? This default to false. Allowing inbound
+    /// connections will accept and provide request payloads in our events,
+    /// allowing us to respond to them.
+    pub fn allow_inbound(mut self, allow: bool) -> Self {
+        self.allow_inbound = allow;
+        self
+    }
+
+    /// Configure the request timeout. If outgoing requests take more than this
+    /// amount of time to receive a response then an error will be returned instead.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+}
+
+// manual debug impl, but ensures that we'll get an error if we add a field,
+// and otherwise leans on fmt as much as possible.
+impl core::fmt::Debug for RequestResponseProtocol {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        #[derive(Debug)]
+        #[allow(unused)]
+        struct RequestResponseProtocol<'a> {
+            name: &'a String,
+            allow_inbound: &'a bool,
+            timeout: &'a Duration,
+            max_response_size_in_bytes: &'a usize,
+            response: Option<&'static str>
+        }
+
+        let Self {
+            name,
+            allow_inbound,
+            timeout,
+            max_response_size_in_bytes,
+        } = self;
+
+        RequestResponseProtocol { 
+            name, 
+            allow_inbound, 
+            timeout,
+            max_response_size_in_bytes,
+            response: response.as_ref().map(|_| "<function>")
+        }.fmt(f)
+    }
+}
+
+/// The ID for a single [`RequestResponseProtocol`].
+pub struct RequestResponseProtocolId(usize);
+
+impl From<OpaqueId> for RequestResponseProtocolId {
+    fn from(value: OpaqueId) -> Self {
+        RequestResponseProtocolId(value.get())
+    }
+}
+
+#[allow(private_interfaces)]
+impl Protocol for RequestResponseProtocol {
+    type Id = RequestResponseProtocolId;
+    fn into_any_protocol(self) -> AnyProtocol {
+        AnyProtocol::RequestResponse(self)
+    }
+}
+
+/// Define a "subscription" protocol using this. Subscription protocols
+/// entail one side making a single request containing an initial handshake,
+/// and then validating a handshake from the other side, and then receiving
+/// a stream of notifications back.
+#[derive(Clone)]
+pub struct SubscriptionProtocol {
+    name: String,
+    allow_inbound: bool,
+    max_response_size_in_bytes: usize,
+    our_handshake: Vec<u8>,
+    handshake_verification: Option<Arc<dyn Fn(Vec<u8>) -> bool>>,
+}
+
+// manual debug impl, but ensures that we'll get an error if we add a field,
+// and otherwise leans on fmt as much as possible.
+impl core::fmt::Debug for SubscriptionProtocol {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        #[derive(Debug)]
+        #[allow(unused)]
+        struct SubscriptionProtocol<'a> {
+            name: &'a String,
+            allow_inbound: &'a bool,
+            max_response_size_in_bytes: &'a usize,
+            our_handshake: &'a Vec<u8>,
+            handshake_verification: Option<&'static str>
+        }
+
+        let Self {
+            name,
+            allow_inbound,
+            max_response_size_in_bytes,
+            our_handshake,
+            handshake_verification
+        } = self;
+
+        SubscriptionProtocol { 
+            name, 
+            allow_inbound,
+            max_response_size_in_bytes,
+            our_handshake,
+            handshake_verification: handshake_verification.as_ref().map(|_| "<function>")
+        }.fmt(f)
+    }
+}
+
+/// The ID for a single [`SubscriptionProtocol`].
+pub struct SubscriptionProtocolId(usize);
+
+impl From<OpaqueId> for SubscriptionProtocolId {
+    fn from(value: OpaqueId) -> Self {
+        SubscriptionProtocolId(value.get())
+    }
+}
+
+#[allow(private_interfaces)]
+impl Protocol for SubscriptionProtocol {
+    type Id = SubscriptionProtocolId;
+    fn into_any_protocol(self) -> AnyProtocol {
+        AnyProtocol::Subscription(self)
+    }
 }
 
 // -----------------------------------------------------------
@@ -49,7 +329,10 @@ pub trait PlatformT {
 #[derive(Debug, Clone)]
 pub struct Configuration<Platform> {
     identity_secret: Option<[u8; 32]>,
+    noise_timeout: Duration,
+    multistream_timeout: Duration,
     marker: PhantomData<(Platform,)>,
+    protocols: Vec<(OpaqueId, AnyProtocol)>,
 }
 
 impl<Platform: PlatformT> Configuration<Platform> {
@@ -57,14 +340,37 @@ impl<Platform: PlatformT> Configuration<Platform> {
     pub fn new() -> Self {
         Self {
             identity_secret: None,
+            noise_timeout: Duration::from_secs(30),
+            multistream_timeout: Duration::from_secs(10),
             marker: PhantomData,
+            protocols: Default::default()
         }
+    }
+
+    /// Add a [`RequestResponseProtocol`] or a [`SubscriptionProtocol`], returning a unique
+    /// ID for this protocol that can be used to interact with it.
+    pub fn add_protocol<P: Protocol>(&mut self, protocol: P) -> P::Id {
+        let next_id = OpaqueId::new();
+        self.protocols.push((next_id, protocol.into_any_protocol()));
+        P::Id::from(next_id)
     }
 
     /// Set a static identity that will be used for all connections using this configuration.
     /// If this is not provided then a unique random identity will be created for each connection.
     pub fn with_identity(mut self, secret_bytes: [u8; 32]) -> Self {
         self.identity_secret = Some(secret_bytes);
+        self
+    }
+
+    /// Configure the timeout to establishing noise encryption with a peer. Defaults to 30 seconds.
+    pub fn with_noise_timeout(mut self, timeout: Duration) -> Self {
+        self.noise_timeout = timeout;
+        self
+    }
+    
+    /// Configure the timeouts to negotiating multistream protocols with a peer. Defaults to 10 seconds.
+    pub fn with_multistream_timeout(mut self, timeout: Duration) -> Self {
+        self.multistream_timeout = timeout;
         self
     }
 
@@ -75,7 +381,7 @@ impl<Platform: PlatformT> Configuration<Platform> {
         &self,
         stream: Stream,
     ) -> Result<Connection<Stream, Platform>, ConnectionError> {
-        Connection::from_stream(stream, self.identity_secret, None).await
+        Connection::from_stream(self, stream, None).await
     }
 
     /// Connect to a peer given some read/write byte stream that has already been established with it,
@@ -85,7 +391,7 @@ impl<Platform: PlatformT> Configuration<Platform> {
         stream: Stream,
         peer_id: PeerId,
     ) -> Result<Connection<Stream, Platform>, ConnectionError> {
-        Connection::from_stream(stream, self.identity_secret, Some(peer_id)).await
+        Connection::from_stream(self, stream, Some(peer_id)).await
     }
 }
 
@@ -101,8 +407,15 @@ pub struct Connection<Stream, Platform> {
     requests: BTreeMap<YamuxStreamId, RequestState>,
     subscriptions: Vec<SubscriptionDetails>,
     next_buf: VecDeque<Message>,
+    handlers: Vec<HandlerFn<Stream, Platform>>,
     marker: PhantomData<(Platform,)>,
 }
+
+/// A handler that can run on each message, giving the message back if it should
+/// be passed to the next handler or returning `None` if it should not.
+type HandlerFn<Stream, Platform> = Arc<
+    dyn Fn(&mut Connection<Stream, Platform>, Message) -> Pin<Box<dyn Future<Output = Option<Message>>>>
+>;
 
 struct SubscriptionDetails {
     protocol_name: String,
@@ -232,24 +545,39 @@ enum RequestState {
 
 impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
     async fn from_stream(
+        config: &Configuration<Platform>,
         mut stream: Stream,
-        identity_secret: Option<[u8; 32]>,
         remote_peer_id: Option<PeerId>,
     ) -> Result<Self, ConnectionError> {
-        // TODO: Make these configurable.
-        const NEGOTIATE_TIMEOUT_MS: usize = 10_000;
-        const NOISE_HANDSHAKE_TIMEOUT_MS: usize = 30_000;
+        let handlers: Vec<HandlerFn<_,_>> = config
+            .protocols
+            .iter()
+            .filter_map(|(id, proto)| {
+                match proto {
+                    AnyProtocol::RequestResponse(p) => {
+                        p.response.as_ref().map(|f| {
+                            let f = f.clone();
+
+                        })
+                    },
+                    AnyProtocol::Subscription(p) => {
+                        p.handshake_verification.as_ref().map(|f| {
+
+                        })
+                    }
+                }
+            }).collect();
 
         // Agree to use the noise protocol.
         Platform::timeout(
-            NEGOTIATE_TIMEOUT_MS,
+            config.multistream_timeout,
             multistream::negotiate_dialer(&mut stream, "/noise"),
         )
         .await
         .map_err(|()| ConnectionError::NoiseNegotiationTimeout)??;
 
         // Generate/use an identity for ourselves.
-        let identity = match identity_secret {
+        let identity = match config.identity_secret {
             Some(key) => peer_id::Identity::from_random_bytes(key),
             None => {
                 let mut random_bytes = [0u8; 32];
@@ -260,7 +588,7 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
 
         // Establish our encrypted noise session and find the remote Peer ID
         let (mut noise_stream, remote_id) = Platform::timeout(
-            NOISE_HANDSHAKE_TIMEOUT_MS,
+            config.noise_timeout,
             noise::handshake_dialer::<_, Platform>(stream, &identity, remote_peer_id.as_ref()),
         )
         .await
@@ -268,7 +596,7 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
 
         // Agree to use the yamux protocol in this noise stream.
         Platform::timeout(
-            NEGOTIATE_TIMEOUT_MS,
+            config.multistream_timeout,
             multistream::negotiate_dialer(&mut noise_stream, "/yamux/1.0.0"),
         )
         .await
