@@ -11,6 +11,7 @@ mod utils;
 
 use alloc::collections::{BTreeMap, vec_deque::VecDeque};
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::future::Future;
 use core::marker::PhantomData;
@@ -20,110 +21,9 @@ use layers::{
     multistream, noise, yamux,
     yamux_multistream::{self, YamuxStreamId},
 };
-use utils::peer_id;
-use utils::opaque_id::OpaqueId;
 use utils::debug_ignore::DebugIgnore;
-use alloc::sync::Arc;
-
-/*
-
-// Define protocols:
-
-let ping = RequestResponseConfig::new("/ipfs/ping/1.0.0")
-    .allow_inbound(true)
-    .with_timeout(timeout)
-    .with_max_size(size)
-    .with_response(|request| request); // if present then this would be elided from events entirely
-
-let kad = RequestResponseConfig::new("/kad/1.0.0")
-    .allow_inbound(false);
-
-let blocks = NotificationConfig::new("/blocks/1.0.0", our_handshake)
-    .allow_inbound(false)
-    .with_timeout(timeout)
-    .with_max_size(size)
-    .with_handshake_verification(|handshake| true);
-
-let warp_sync = RequestResponseConfig::new("/kad/1.0.0");
-
-// Make configuration
-
-let mut config = Configuration::new()
-    .with_identity(...)
-    .with_noise_timeout(10000);
-
-let ping_id = config.add_protocol(ping);
-let kad_id = config.add_protocol(kad);
-let blocks_id = config.add_protocol(blocks);
-let warp_id = config.add_protocol(warp_sync);
-
-// We can add middleware that reacts / consumes events
-config.add_handler(async |event| {
-    // return event:
-    Some(event)
-    // filter event:
-    None
-})
-
-// Connect to peers from configuration
-
-let peer = Connection::new(&config, peer).await?;
-
-let request_id = peer.request(ping_id, b"hello");
-let sub_id = peer.subscribe(blocks_id);
-
-match peer.next().await? {
-    // Handle responses to requests:
-    Message::Response {
-        protocol_id: warp_id,
-        request_id,
-        response
-    } => {
-        // handle warp response
-    },
-    Message::Response {
-        protocol_id: ping_id,
-        request_id,
-        response
-    } => {
-        // handle ping responses
-    },
-
-    // Handle incoming requests:
-    Message::Request {
-        protocol_id: ping_id,
-        request_id,
-        request
-    } => {
-        // echo back request to respond to ping.
-        peer.respond(request_id, request)
-    },
-
-    // Handle notification items
-    Message::Notification {
-        protocol_id: blocks_id,
-        subscription_id,
-        response,
-    } => {
-        // handle incoming block header 
-    }
-
-    // Handle incoming subscription requests
-    Message::Subscribe {
-        protocol_id: blocks_id,
-        subscription_id,
-        handshake
-    } => {
-        peer.accept_subscription(subscription_id);
-        // or
-        peer.reject_subscription(subscription_id);
-        // or verify handshake fn provided so this is done automatically
-        // then periodically:
-        peer.send_message(subscription_id, bytes);
-    }
-}
-
-*/
+use utils::opaque_id::OpaqueId;
+use utils::peer_id;
 
 // Re-export anything that is part of the public APIs.
 pub use crate::error::{ConnectionError, ProtocolError, StreamError};
@@ -182,7 +82,7 @@ impl AnyProtocol {
         match self {
             AnyProtocol::Request(_) => None,
             AnyProtocol::Subscription(p) => Some(p),
-        }   
+        }
     }
 }
 
@@ -198,7 +98,7 @@ pub struct RequestProtocol {
 }
 
 impl RequestProtocol {
-    /// Create a new [`RequestProtocol`], providing the 
+    /// Create a new [`RequestProtocol`], providing the
     /// multistream protocol name that it will match on.
     pub fn new(name: impl Into<String>) -> Self {
         Self {
@@ -269,7 +169,7 @@ pub struct SubscriptionProtocol {
 }
 
 impl SubscriptionProtocol {
-    /// Create a new [`RequestProtocol`], providing the 
+    /// Create a new [`SubscriptionProtocol`], providing the
     /// multistream protocol name that it will match on.
     pub fn new<F: 'static + Fn(Vec<u8>) -> bool>(
         name: impl Into<String>,
@@ -347,7 +247,7 @@ impl<Platform: PlatformT> Configuration<Platform> {
             noise_timeout: Duration::from_secs(30),
             multistream_timeout: Duration::from_secs(10),
             marker: PhantomData,
-            protocols: Default::default()
+            protocols: Default::default(),
         }
     }
 
@@ -371,7 +271,7 @@ impl<Platform: PlatformT> Configuration<Platform> {
         self.noise_timeout = timeout;
         self
     }
-    
+
     /// Configure the timeouts to negotiating multistream protocols with a peer. Defaults to 10 seconds.
     pub fn with_multistream_timeout(mut self, timeout: Duration) -> Self {
         self.multistream_timeout = timeout;
@@ -410,7 +310,8 @@ pub struct Connection<Stream, Platform> {
     our_id: PeerId,
     subscription_details: Vec<SubscriptionDetails>,
     request_details: Vec<RequestDetails>,
-    inflight_requests: BTreeMap<YamuxStreamId, RequestState>,
+    incoming_requests: BTreeMap<YamuxStreamId, RequestProtocolId>,
+    inflight_requests: BTreeMap<YamuxStreamId, (RequestProtocolId, RequestState)>,
     next_buf: VecDeque<Message>,
     marker: PhantomData<(Platform,)>,
 }
@@ -443,19 +344,20 @@ impl SubscriptionDetails {
 
 enum SubscriptionStreamState {
     Closed,
-    Handshake {
-        stream_id: YamuxStreamId,
-    },
-    Open {
-        stream_id: YamuxStreamId,
-    }
+    Handshake { stream_id: YamuxStreamId },
+    Open { stream_id: YamuxStreamId },
 }
 
 impl SubscriptionStreamState {
+    fn is_closed(&self) -> bool {
+        matches!(self, SubscriptionStreamState::Closed)
+    }
+    fn is_open(&self) -> bool {
+        matches!(self, SubscriptionStreamState::Open { .. })
+    }
     fn stream_id(&self) -> Option<YamuxStreamId> {
         match self {
-            Self::Handshake { stream_id }
-            | Self::Open { stream_id } => Some(*stream_id),
+            Self::Handshake { stream_id } | Self::Open { stream_id } => Some(*stream_id),
             _ => None,
         }
     }
@@ -465,20 +367,45 @@ impl SubscriptionStreamState {
 /// [`Connection::request()`] that we call, and a stream of [`Message::Notification`]s for any
 /// [`Connection::subscribe()`] subscription that we create.
 pub enum Message {
+    /// An incoming request. Respond with [`Connection::respond()`].
+    Request {
+        /// The ID to use to respond to this request.
+        id: ResponseId,
+        /// The protocol that this request is for.
+        protocol_id: RequestProtocolId,
+        /// The request bytes.
+        req: Request,
+    },
     /// A response to some [`Connection::request()`].
     Response {
         /// The [`RequestId`] that this message is for.
         id: RequestId,
+        /// The protocol that this message is for.
+        protocol_id: RequestProtocolId,
         /// A response for this request.
         res: RequestResponse,
     },
     /// A notification for some [`Connection::subscribe()`] subscription.
     Notification {
         /// The [`SubscriptionProtocolId`] that this notification is for.
-        id: SubscriptionProtocolId,
+        protocol_id: SubscriptionProtocolId,
         /// A response for this subscription.
         res: SubscriptionResponse,
     },
+}
+
+/// An ID to use to respond to some incoming request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ResponseId(YamuxStreamId);
+
+/// An incoming request.
+pub enum Request {
+    /// The incoming request payload.
+    Value(Vec<u8>),
+    /// The remote cancelled their request.
+    Cancelled,
+    /// The remote payload was too large so the request was dropped.
+    ErrorPayloadTooLarge,
 }
 
 /// An ID which identifies some [`Connection::request`] call. The response related to this
@@ -511,9 +438,11 @@ pub enum RequestResponseError {
     MultistreamProtocolError,
 }
 
-/// A response to some [`Connection::request()`], found in a [`Message::Response`].
-/// We receive back exactly response 1 per request.
+/// A response to some [`Connection::subscribe()`], found in a [`Message::Notification`].
 pub enum SubscriptionResponse {
+    /// the subscription stream has been opened and is ready for sending and receiving.
+    /// Sending can now be done using [`Connection::send_notification()`].
+    Opened,
     /// A value received back on the given subscription.
     Value(Vec<u8>),
     /// The subscription was closed or cancelled. No more values will be handed back for it.
@@ -588,27 +517,23 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
         let subscriptions = config
             .protocols
             .iter()
-            .filter_map(|(id,p)| p.as_subcription().map(|p| (id,p)))
-            .map(|(id,p)| {
-                SubscriptionDetails {
-                    protocol_id: SubscriptionProtocolId(id.get()),
-                    protocol: p.clone(),
-                    our_stream: SubscriptionStreamState::Closed,
-                    their_stream: SubscriptionStreamState::Closed,
-                }
+            .filter_map(|(id, p)| p.as_subcription().map(|p| (id, p)))
+            .map(|(id, p)| SubscriptionDetails {
+                protocol_id: SubscriptionProtocolId(id.get()),
+                protocol: p.clone(),
+                our_stream: SubscriptionStreamState::Closed,
+                their_stream: SubscriptionStreamState::Closed,
             })
             .collect();
-    
+
         // And our request protocol details
         let requests = config
             .protocols
             .iter()
-            .filter_map(|(id,p)| p.as_request().map(|p| (id,p)))
-            .map(|(id,p)| {
-                RequestDetails {
-                    protocol_id: RequestProtocolId(id.get()),
-                    protocol: p.clone(),
-                }
+            .filter_map(|(id, p)| p.as_request().map(|p| (id, p)))
+            .map(|(id, p)| RequestDetails {
+                protocol_id: RequestProtocolId(id.get()),
+                protocol: p.clone(),
             })
             .collect();
 
@@ -617,6 +542,7 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
             remote_id,
             our_id: identity.peer_id(),
             request_details: requests,
+            incoming_requests: Default::default(),
             inflight_requests: Default::default(),
             subscription_details: subscriptions,
             next_buf: Default::default(),
@@ -642,8 +568,12 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
         request: Vec<u8>,
     ) -> Result<RequestId, ConnectionError> {
         // Find the protocol details
-        let Some(p) = self.request_details.iter().find(|p| p.protocol_id == protocol_id) else {
-            return Err(ConnectionError::RequestProtocolNotFound(protocol_id))
+        let Some(p) = self
+            .request_details
+            .iter()
+            .find(|p| p.protocol_id == protocol_id)
+        else {
+            return Err(ConnectionError::RequestProtocolNotFound(protocol_id));
         };
 
         // Open a stream.
@@ -655,7 +585,10 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
         // Save the request to send once the stream is open.
         self.inflight_requests.insert(
             stream_id,
-            RequestState::AwaitingProtocolConfirmation(request),
+            (
+                protocol_id,
+                RequestState::AwaitingProtocolConfirmation(request),
+            ),
         );
 
         Ok(RequestId(stream_id))
@@ -664,15 +597,28 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
     /// Cancel a request. This makes a best-effort attempt to cancel an in-flight request when driven by [`Self::next`],
     /// and will lead to a [`RequestResponse::Cancelled`] message being emitted for the given request ID.
     pub fn cancel_request(&mut self, id: RequestId) {
-        self.inflight_requests.remove(&id.0);
+        let Some((protocol_id, _)) = self.inflight_requests.remove(&id.0) else {
+            return;
+        };
+
         let _ = self.yamux.close_stream(id.0);
         self.next_buf.push_back(Message::Response {
             id,
+            protocol_id,
             res: RequestResponse::Cancelled,
         });
     }
 
-    /// Begin the subscription on one of our subscription protocols. We will get back a stream 
+    /// Respond to an incoming request.
+    pub fn respond(&mut self, id: ResponseId, response: &[u8]) {
+        // If we want to handle eg the stream having been closed then we should
+        // also emit a ResponseCancelled type message. For now though we just fire
+        // and forget to respond to some request.
+        let _ = self.yamux.send_data(id.0, response);
+        let _ = self.yamux.close_stream(id.0);
+    }
+
+    /// Begin the subscription on one of our subscription protocols. We will get back a stream
     /// of notification messages against the provided [`SubscriptionProtocolId`] when
     /// call [`Self::next`], until the subscription is closed, cancelled or returns an error.
     pub fn subscribe<F: FnMut(Vec<u8>) -> bool + 'static>(
@@ -680,30 +626,72 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
         protocol_id: SubscriptionProtocolId,
     ) -> Result<(), ConnectionError> {
         // Find the protocol
-        let Some(p) = self.subscription_details.iter_mut().find(|p| p.protocol_id == protocol_id) else {
-            return Err(ConnectionError::SubscriptionProtocolNotFound(protocol_id))
+        let Some(p) = self
+            .subscription_details
+            .iter_mut()
+            .find(|p| p.protocol_id == protocol_id)
+        else {
+            return Err(ConnectionError::SubscriptionProtocolNotFound(protocol_id));
         };
 
         // If already open then we've already kicked this off so complain.
-        if !matches!(p.our_stream, SubscriptionStreamState::Closed) {
-            return Err(ConnectionError::AlreadySubscribed(p.protocol_id))
+        if !p.our_stream.is_closed() {
+            return Err(ConnectionError::AlreadySubscribed(p.protocol_id));
         }
 
         // Open an outbound stream.
-        let stream_id = self.yamux.open_stream(Some(&p.protocol.name), p.protocol.max_response_size_in_bytes)?;
+        let stream_id = self.yamux.open_stream(
+            Some(&p.protocol.name),
+            p.protocol.max_response_size_in_bytes,
+        )?;
         p.our_stream = SubscriptionStreamState::Handshake { stream_id };
 
         Ok(())
+    }
+
+    /// Send a notification on a subscription. The subscription must have already been opened
+    /// (ie a [`SubscriptionResponse::Opened`] has been emitted for it, which is the result of either
+    /// calling [`Connection::subscribe()`] or the remote opening it) before we can send messages.
+    pub fn send_notification(
+        &mut self,
+        protocol_id: SubscriptionProtocolId,
+        notif: &[u8],
+    ) -> Result<(), ConnectionError> {
+        // Find the protocol
+        let Some(p) = self
+            .subscription_details
+            .iter_mut()
+            .find(|p| p.protocol_id == protocol_id)
+        else {
+            return Err(ConnectionError::SubscriptionProtocolNotFound(protocol_id));
+        };
+
+        match p.our_stream {
+            SubscriptionStreamState::Closed => {
+                Err(ConnectionError::SubscriptionClosed(protocol_id))
+            }
+            SubscriptionStreamState::Handshake { .. } => {
+                Err(ConnectionError::SubscriptionNotReady(protocol_id))
+            }
+            SubscriptionStreamState::Open { stream_id } => {
+                self.yamux.send_data(stream_id, notif)?;
+                Ok(())
+            }
+        }
     }
 
     /// Cancel a subscription. This makes a best-effort attempt to cancel an in-flight subscription when driven by [`Self::next`],
     /// and will lead to a [`SubscriptionResponse::Closed`] message being emitted for the given subscription ID.
     pub fn cancel_subscription(&mut self, id: SubscriptionProtocolId) {
         // Find the protocol
-        let Some(p) = self.subscription_details.iter_mut().find(|p| p.protocol_id == id) else {
-            return
+        let Some(p) = self
+            .subscription_details
+            .iter_mut()
+            .find(|p| p.protocol_id == id)
+        else {
+            return;
         };
-        
+
         if let Some(outgoing_stream_id) = p.our_stream.stream_id() {
             let _ = self.yamux.close_stream(outgoing_stream_id);
         };
@@ -715,7 +703,7 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
         p.their_stream = SubscriptionStreamState::Closed;
 
         self.next_buf.push_back(Message::Notification {
-            id,
+            protocol_id: id,
             res: SubscriptionResponse::Closed,
         });
     }
@@ -743,10 +731,12 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
 
             use yamux_multistream::OutputState;
 
-            // ----------------------------------
-            // Is this a message on a request stream that we are expecting a single response on?
-            // ----------------------------------
-            if let Some(info) = self.inflight_requests.get_mut(&stream_id) {
+            if let Some((protocol_id, info)) = self.inflight_requests.get_mut(&stream_id) {
+                // ----------------------------------
+                // Is this a message on a request stream that we are expecting a single response on?
+                // ----------------------------------
+                
+                let protocol_id = *protocol_id;
                 match info {
                     RequestState::AwaitingProtocolConfirmation(request) => {
                         match output.state {
@@ -755,13 +745,13 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                             OutputState::OutgoingAccepted(_) => {
                                 self.yamux.send_data(stream_id, &core::mem::take(request))?;
                                 *info = RequestState::AwaitingResponsePayload;
-                                continue;
                             }
                             // Else if the protocol is invalid we'll relay that to the user.
                             OutputState::OutgoingRejected => {
                                 self.inflight_requests.remove(&stream_id);
                                 return Ok(Some(Message::Response {
                                     id: RequestId(stream_id),
+                                    protocol_id,
                                     res: RequestResponse::Error(
                                         RequestResponseError::ProtocolRejected,
                                     ),
@@ -771,9 +761,10 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                             // Close the stream and return the error to the user.
                             _ => {
                                 self.inflight_requests.remove(&stream_id);
-                                self.yamux.close_stream_immediately(stream_id)?;
+                                self.yamux.close_stream_immediately(stream_id);
                                 return Ok(Some(Message::Response {
                                     id: RequestId(stream_id),
+                                    protocol_id,
                                     res: RequestResponse::Error(
                                         RequestResponseError::MultistreamProtocolError,
                                     ),
@@ -788,6 +779,7 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                                 self.inflight_requests.remove(&stream_id);
                                 return Ok(Some(Message::Response {
                                     id: RequestId(stream_id),
+                                    protocol_id,
                                     res: RequestResponse::Value(bytes),
                                 }));
                             }
@@ -803,6 +795,7 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                                 };
                                 return Ok(Some(Message::Response {
                                     id: RequestId(stream_id),
+                                    protocol_id,
                                     res: RequestResponse::Error(error),
                                 }));
                             }
@@ -810,9 +803,10 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                             // Close the stream and return the error to the user.
                             _ => {
                                 self.inflight_requests.remove(&stream_id);
-                                self.yamux.close_stream_immediately(stream_id)?;
+                                self.yamux.close_stream_immediately(stream_id);
                                 return Ok(Some(Message::Response {
                                     id: RequestId(stream_id),
+                                    protocol_id,
                                     res: RequestResponse::Error(
                                         RequestResponseError::MultistreamProtocolError,
                                     ),
@@ -821,16 +815,48 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                         }
                     }
                 }
-            }
+            } else if let Some(protocol_id) = self.incoming_requests.remove(&stream_id) {
+                // ----------------------------------
+                // Is this data on a known incoming request stream that we can respond to?
+                // ----------------------------------
 
-            // ----------------------------------
-            // Is this a message back on an outgoing subscription stream that we opened.
-            // ----------------------------------
-            else if let Some(p) = self
+                match output.state {
+                    OutputState::Data(payload) => {
+                        return Ok(Some(Message::Request { 
+                            id: ResponseId(stream_id), 
+                            protocol_id, 
+                            req: Request::Value(payload),
+                        }))
+                    },
+                    OutputState::Closed(CloseReason::ClosedByRemote) => {
+                        return Ok(Some(Message::Request {
+                            id: ResponseId(stream_id), 
+                            protocol_id,
+                            req: Request::Cancelled,
+                        }))
+                    },
+                    OutputState::Closed(CloseReason::IncomingMessageTooLarge) => {
+                        return Ok(Some(Message::Request {
+                            id: ResponseId(stream_id), 
+                            protocol_id,
+                            req: Request::ErrorPayloadTooLarge,
+                        }))
+                    },
+                    _ => {
+                        // Anything else is a protocol error. Just close and ignore
+                        // this. We've removed the request from our map anyway.
+                        self.yamux.close_stream_immediately(stream_id);
+                    }
+                }
+            } else if let Some(p) = self
                 .subscription_details
                 .iter_mut()
                 .find(|p| p.outbound_stream_id() == Some(stream_id))
             {
+                // ----------------------------------
+                // Is this a message back on an outgoing subscription stream that we opened.
+                // ----------------------------------
+
                 let protocol_id = p.protocol_id;
                 match p.our_stream {
                     SubscriptionStreamState::Handshake { stream_id } => {
@@ -844,7 +870,7 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                                 p.our_stream = SubscriptionStreamState::Closed;
                                 self.cancel_subscription(protocol_id);
                                 return Ok(Some(Message::Notification {
-                                    id: protocol_id,
+                                    protocol_id,
                                     res: SubscriptionResponse::Error(
                                         SubscriptionResponseError::ProtocolRejected,
                                     ),
@@ -855,11 +881,19 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                                 if (p.protocol.validate_their_handshake)(their_handshake) {
                                     // If their handshake is valid, our outbound is now open.
                                     p.our_stream = SubscriptionStreamState::Open { stream_id };
+                                    // If both sides are open then we notify the user that
+                                    // the subscription is open and ready now.
+                                    if p.our_stream.is_open() && p.their_stream.is_open() {
+                                        return Ok(Some(Message::Notification { 
+                                            protocol_id, 
+                                            res: SubscriptionResponse::Opened, 
+                                        }))
+                                    }
                                 } else {
                                     // Else it's all gone wrong, close and tidy.
                                     self.cancel_subscription(protocol_id);
                                     return Ok(Some(Message::Notification {
-                                        id: protocol_id,
+                                        protocol_id,
                                         res: SubscriptionResponse::Error(
                                             SubscriptionResponseError::TheirHandshakeRejected,
                                         ),
@@ -871,7 +905,7 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                                 p.our_stream = SubscriptionStreamState::Closed;
                                 self.cancel_subscription(protocol_id);
                                 return Ok(Some(Message::Notification {
-                                    id: protocol_id,
+                                    protocol_id,
                                     res: SubscriptionResponse::Error(
                                         SubscriptionResponseError::OurHandshakeRejected,
                                     ),
@@ -882,7 +916,7 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                                 p.our_stream = SubscriptionStreamState::Closed;
                                 self.cancel_subscription(protocol_id);
                                 return Ok(Some(Message::Notification {
-                                    id: protocol_id,
+                                    protocol_id,
                                     res: SubscriptionResponse::Error(SubscriptionResponseError::RemotePayloadTooLarge),
                                 }));
                             },
@@ -890,7 +924,7 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                             OutputState::IncomingProtocol(_) => {
                                 self.cancel_subscription(protocol_id);
                                 return Ok(Some(Message::Notification {
-                                    id: protocol_id,
+                                    protocol_id,
                                     res: SubscriptionResponse::Error(
                                         SubscriptionResponseError::MultistreamProtocolError,
                                     ),
@@ -904,7 +938,7 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                                 p.our_stream = SubscriptionStreamState::Closed;
                                 self.cancel_subscription(protocol_id);
                                 return Ok(Some(Message::Notification {
-                                    id: protocol_id,
+                                    protocol_id,
                                     res: SubscriptionResponse::Closed,
                                 }));
                             },
@@ -912,7 +946,7 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                                 p.our_stream = SubscriptionStreamState::Closed;
                                 self.cancel_subscription(protocol_id);
                                 return Ok(Some(Message::Notification {
-                                    id: protocol_id,
+                                    protocol_id,
                                     res: SubscriptionResponse::Error(SubscriptionResponseError::RemotePayloadTooLarge),
                                 }));
                             },
@@ -920,7 +954,7 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                             _ => {
                                 self.cancel_subscription(protocol_id);
                                 return Ok(Some(Message::Notification {
-                                    id: protocol_id,
+                                    protocol_id,
                                     res: SubscriptionResponse::Error(
                                         SubscriptionResponseError::MultistreamProtocolError,
                                     ),
@@ -929,16 +963,10 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                         }
                     },
                     SubscriptionStreamState::Closed => {
-                        // Impossible for it to be closed when we found it
-                        continue
+                        // Impossible for it to be closed when we found it; ignore
                     }
                 }
-            }
-
-            // ----------------------------------
-            // Is this a message on an incoming subscription stream that we are interested in
-            // ----------------------------------
-            else if let Some(p) = self
+            } else if let Some(p) = self
                 .subscription_details
                 .iter_mut()
                 .find(|p| {
@@ -948,14 +976,32 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                     || matches!(&output.state, OutputState::IncomingProtocol(n) if n == &p.protocol.name)
                 })
             {
+                // ----------------------------------
+                // Is this a message on an incoming subscription stream that we are interested in
+                // ----------------------------------
+
                 let protocol_id = p.protocol_id;
                 match p.their_stream {
                     SubscriptionStreamState::Closed => {
+                        // Only allow the inbound stream if we have opened ours
+                        // already, or if we set allow_inbound to true.
+                        if !p.protocol.allow_inbound && p.our_stream.is_closed() {
+                            self.yamux.close_stream_immediately(stream_id);
+                            continue
+                        }
+
                         // This is always the initial state; if we get here then we simply
                         // need to accept their incoming protocol (see the .find() above)
                         // and transition to waiting for their handshake.
                         self.yamux.accept_protocol(stream_id, p.protocol.max_response_size_in_bytes)?;
                         p.their_stream = SubscriptionStreamState::Handshake { stream_id };
+
+                        // If we haven't started opening our end yet then do this. We need
+                        // their_stream and our_stream to be Open for the subscription to be open.
+                        if p.our_stream.is_closed() {
+                            let stream_id = self.yamux.open_stream(Some(&p.protocol.name), p.protocol.max_response_size_in_bytes)?;
+                            p.our_stream = SubscriptionStreamState::Handshake { stream_id };
+                        }
                     },
                     SubscriptionStreamState::Handshake { stream_id } => {
                         match output.state {
@@ -964,11 +1010,20 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                                     // If their handshake is valid, send ours and wai for data.
                                     self.yamux.send_data(stream_id, &p.protocol.our_handshake)?;
                                     p.our_stream = SubscriptionStreamState::Open { stream_id };
+
+                                    // If both sides are open then we notify the user that
+                                    // the subscription is open and ready now.
+                                    if p.our_stream.is_open() && p.their_stream.is_open() {
+                                        return Ok(Some(Message::Notification { 
+                                            protocol_id, 
+                                            res: SubscriptionResponse::Opened, 
+                                        }))
+                                    }
                                 } else {
                                     // Else it's all gone wrong, close and tidy.
                                     self.cancel_subscription(protocol_id);
                                     return Ok(Some(Message::Notification {
-                                        id: protocol_id,
+                                        protocol_id,
                                         res: SubscriptionResponse::Error(
                                             SubscriptionResponseError::TheirHandshakeRejected,
                                         ),
@@ -979,7 +1034,7 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                                 p.their_stream = SubscriptionStreamState::Closed;
                                 self.cancel_subscription(protocol_id);
                                 return Ok(Some(Message::Notification {
-                                    id: protocol_id,
+                                    protocol_id,
                                     res: SubscriptionResponse::Closed,
                                 }));
                             },
@@ -987,7 +1042,7 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                                 p.their_stream = SubscriptionStreamState::Closed;
                                 self.cancel_subscription(protocol_id);
                                 return Ok(Some(Message::Notification {
-                                    id: protocol_id,
+                                    protocol_id,
                                     res: SubscriptionResponse::Error(SubscriptionResponseError::RemotePayloadTooLarge),
                                 }));
                             },
@@ -995,7 +1050,7 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                             _ => {
                                 self.cancel_subscription(protocol_id);
                                 return Ok(Some(Message::Notification {
-                                    id: protocol_id,
+                                    protocol_id,
                                     res: SubscriptionResponse::Error(
                                         SubscriptionResponseError::MultistreamProtocolError,
                                     ),
@@ -1007,15 +1062,15 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                         match output.state {
                             OutputState::Data(data) => {
                                 return Ok(Some(Message::Notification { 
-                                    id: protocol_id, 
-                                    res: SubscriptionResponse::Value(data) 
+                                    protocol_id, 
+                                    res: SubscriptionResponse::Value(data)
                                 }))
                             },
                             OutputState::Closed(CloseReason::ClosedByRemote) => {
                                 p.their_stream = SubscriptionStreamState::Closed;
                                 self.cancel_subscription(protocol_id);
                                 return Ok(Some(Message::Notification {
-                                    id: protocol_id,
+                                    protocol_id,
                                     res: SubscriptionResponse::Closed,
                                 }));
                             },
@@ -1023,7 +1078,7 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                                 p.their_stream = SubscriptionStreamState::Closed;
                                 self.cancel_subscription(protocol_id);
                                 return Ok(Some(Message::Notification {
-                                    id: protocol_id,
+                                    protocol_id,
                                     res: SubscriptionResponse::Error(SubscriptionResponseError::RemotePayloadTooLarge),
                                 }));
                             },
@@ -1031,7 +1086,7 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                             _ => {
                                 self.cancel_subscription(protocol_id);
                                 return Ok(Some(Message::Notification {
-                                    id: protocol_id,
+                                    protocol_id,
                                     res: SubscriptionResponse::Error(
                                         SubscriptionResponseError::MultistreamProtocolError,
                                     ),
@@ -1040,12 +1095,24 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                         }
                     },
                 }
-            }
+            } else if let Some(request_details) = self.request_details
+                .iter()
+                .find(|r| {
+                    r.protocol.allow_inbound &&
+                    matches!(&output.state, OutputState::IncomingProtocol(n) if n == &r.protocol.name)
+                })
+            {
+                // ----------------------------------
+                // Is this an incoming request on a protocol that we are allowing incoming requests on?
+                // ----------------------------------
 
-            // ----------------------------------
-            // Is this a message that doesn't relate to any stream we are expecting/interested in?
-            // ----------------------------------
-            else {
+                self.yamux.accept_protocol(stream_id, request_details.protocol.max_response_size_in_bytes)?;
+                self.incoming_requests.insert(stream_id, request_details.protocol_id);
+            } else {
+                // ----------------------------------
+                // Is this a message that doesn't relate to any stream we are expecting/interested in?
+                // ----------------------------------
+
                 // For now we just close/reject any streams we don't know about or want. The request/subscription
                 // may have been cancelled while a response was inbound.
                 match output.state {
@@ -1055,7 +1122,7 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                     OutputState::OutgoingRejected
                     | OutputState::OutgoingAccepted(_)
                     | OutputState::Data(_) => {
-                        self.yamux.close_stream_immediately(output.stream_id)?;
+                        self.yamux.close_stream_immediately(output.stream_id);
                     }
                     OutputState::Closed(_) => {
                         // Nothing to do; the now-unknown stream has closed.

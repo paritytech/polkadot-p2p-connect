@@ -48,7 +48,7 @@ pub enum OutputState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloseReason {
     ClosedByRemote,
-    IncomingMessageTooLarge
+    IncomingMessageTooLarge,
 }
 
 #[derive(Debug)]
@@ -56,7 +56,7 @@ struct Multistream {
     buffer: MultistreamFrameBuffer,
     state: MultistreamState,
     /// The maximum size allowed for incoming messages.
-    /// 
+    ///
     /// When the buffer would be grown beyond this size, stop
     /// pushing data to it close this stream.
     max_buffer_size: usize,
@@ -152,7 +152,11 @@ impl<S: async_stream::AsyncStream> YamuxMultistream<S> {
 
     /// Accept a stream for which [`OutputState::IncomingProtocol`] was emitted.
     /// Errors if we call this for a stream that is not waiting to be accepted / rejected.
-    pub fn accept_protocol(&mut self, stream_id: YamuxStreamId, max_buffer_size: usize) -> Result<(), Error> {
+    pub fn accept_protocol(
+        &mut self,
+        stream_id: YamuxStreamId,
+        max_buffer_size: usize,
+    ) -> Result<(), Error> {
         let Some(stream) = self.bufs.get_mut(&stream_id) else {
             return Err(Error::StreamNotFound(stream_id));
         };
@@ -192,17 +196,15 @@ impl<S: async_stream::AsyncStream> YamuxMultistream<S> {
     }
 
     /// Close a stream.
-    pub fn close_stream(&mut self, stream_id: YamuxStreamId) -> Result<(), Error> {
+    pub fn close_stream(&mut self, stream_id: YamuxStreamId) {
         self.bufs.remove(&stream_id);
         self.inner.close_stream(stream_id);
-        Ok(())
     }
 
     /// Close a stream immediately, unbuffering any messages buffered to send prior to this call.
-    pub fn close_stream_immediately(&mut self, stream_id: YamuxStreamId) -> Result<(), Error> {
+    pub fn close_stream_immediately(&mut self, stream_id: YamuxStreamId) {
         self.bufs.remove(&stream_id);
         self.inner.close_stream_immediately(stream_id);
-        Ok(())
     }
 
     /// Drive our yamux multistream machine, returning output messages as they come in
@@ -250,11 +252,11 @@ impl<S: async_stream::AsyncStream> YamuxMultistream<S> {
                         };
                         // Close if buffer length exceeded.
                         if entry.buffer.len() + bytes.len() > entry.max_buffer_size {
-                            self.close_stream_immediately(stream_id)?;
+                            self.close_stream_immediately(stream_id);
                             return Ok(Some(Output {
                                 stream_id,
                                 state: OutputState::Closed(CloseReason::IncomingMessageTooLarge),
-                            }))
+                            }));
                         }
                         entry.buffer.feed(bytes);
                         entry
@@ -311,7 +313,7 @@ impl<S: async_stream::AsyncStream> YamuxMultistream<S> {
                         )?;
                     } else {
                         tracing::debug!(target: LOG_TARGET, "new incoming stream {stream_id} invalid protocol suggestion: closing");
-                        self.close_stream_immediately(stream_id)?;
+                        self.close_stream_immediately(stream_id);
                     }
                 }
                 // We've done the initial handshake and need to accept some protocol suggestion.
@@ -320,12 +322,12 @@ impl<S: async_stream::AsyncStream> YamuxMultistream<S> {
                     let mut protocol_bytes: Vec<u8> = byte_iter.collect();
                     if protocol_bytes.pop() != Some(b'\n') {
                         tracing::debug!(target: LOG_TARGET, "invalid multistream protocol (no trailing newline): request to close stream {stream_id}");
-                        self.close_stream_immediately(stream_id)?;
+                        self.close_stream_immediately(stream_id);
                         continue;
                     }
                     let Ok(protocol_name) = String::from_utf8(protocol_bytes) else {
                         tracing::debug!(target: LOG_TARGET, "invalid multistream protocol (not utf8): request to close stream {stream_id}");
-                        self.close_stream_immediately(stream_id)?;
+                        self.close_stream_immediately(stream_id);
                         continue;
                     };
 
@@ -343,7 +345,7 @@ impl<S: async_stream::AsyncStream> YamuxMultistream<S> {
                 MultistreamState::NewIncomingProtocolWaitingForAccept(_) => {
                     tracing::debug!(target: LOG_TARGET, "invalid multistream protocol (got bytes on stream waiting to be accepted): request to close stream {stream_id}");
                     drop(byte_iter);
-                    self.close_stream_immediately(stream_id)?;
+                    self.close_stream_immediately(stream_id);
                     continue;
                 }
                 // We initiated an outgoing stream and are waiting for them to accept/reject
@@ -360,7 +362,7 @@ impl<S: async_stream::AsyncStream> YamuxMultistream<S> {
                             *seen_header = true;
                         } else {
                             tracing::debug!(target: LOG_TARGET, "invalid multistream header (2): request to close stream {stream_id}");
-                            self.close_stream_immediately(stream_id)?;
+                            self.close_stream_immediately(stream_id);
                         }
                     } else {
                         // multistream header seen so we are just negotiating the protocol name
@@ -385,7 +387,7 @@ impl<S: async_stream::AsyncStream> YamuxMultistream<S> {
                                 )?;
                             } else {
                                 tracing::debug!(target: LOG_TARGET, "protocol {current} rejected by remote, request to close stream {stream_id}");
-                                self.close_stream_immediately(stream_id)?;
+                                self.close_stream_immediately(stream_id);
                                 return Ok(Some(Output {
                                     stream_id,
                                     state: OutputState::OutgoingRejected,
@@ -563,7 +565,9 @@ mod test {
         );
 
         // We accept!
-        stream.accept_protocol(YamuxStreamId::new(2), usize::MAX).unwrap();
+        stream
+            .accept_protocol(YamuxStreamId::new(2), usize::MAX)
+            .unwrap();
         block_on(stream.next());
 
         // Now the remote should receive an accept message.
@@ -631,7 +635,9 @@ mod test {
         );
 
         // We can then accept it
-        stream.accept_protocol(YamuxStreamId::new(2), usize::MAX).unwrap();
+        stream
+            .accept_protocol(YamuxStreamId::new(2), usize::MAX)
+            .unwrap();
         block_on(stream.next());
 
         // Now the remote should receive an accept message.
@@ -681,10 +687,13 @@ mod test {
         send_data(&mut handle, 2, &[b"/multistream/1.0.0\n", &long_name]);
         let output = next_expecting_output(&mut stream);
 
-        assert_eq!(output, Output { 
-            stream_id: YamuxStreamId::new(2),
-            state: OutputState::Closed(CloseReason::IncomingMessageTooLarge)
-        });
+        assert_eq!(
+            output,
+            Output {
+                stream_id: YamuxStreamId::new(2),
+                state: OutputState::Closed(CloseReason::IncomingMessageTooLarge)
+            }
+        );
     }
 
     #[test]
@@ -696,7 +705,9 @@ mod test {
         open_stream(&mut handle, 2);
         send_data(&mut handle, 2, &[b"/multistream/1.0.0\n", b"/foo/bar\n"]);
         next_expecting_output(&mut stream); // IncomingProtocol
-        stream.accept_protocol(YamuxStreamId::new(2), usize::MAX).unwrap();
+        stream
+            .accept_protocol(YamuxStreamId::new(2), usize::MAX)
+            .unwrap();
         block_on(stream.next()); // Drive things forward after accept
         let _ = next_multistream_frames(&mut handle); // Pull accept frames.
 
@@ -734,7 +745,9 @@ mod test {
         open_stream(&mut handle, 2);
         send_data(&mut handle, 2, &[b"/multistream/1.0.0\n", b"/foo/bar\n"]);
         next_expecting_output(&mut stream); // IncomingProtocol
-        stream.accept_protocol(YamuxStreamId::new(2), usize::MAX).unwrap();
+        stream
+            .accept_protocol(YamuxStreamId::new(2), usize::MAX)
+            .unwrap();
         block_on(stream.next()); // Drive things forward after accept
         let _ = next_multistream_frames(&mut handle); // Pull accept frames.
 

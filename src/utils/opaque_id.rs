@@ -1,4 +1,4 @@
-use core::sync::atomic::{ AtomicUsize, Ordering };
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
