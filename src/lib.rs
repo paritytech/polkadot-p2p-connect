@@ -1007,16 +1007,16 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                         match output.state {
                             OutputState::Data(their_handshake) => {
                                 if (p.protocol.validate_their_handshake)(their_handshake) {
-                                    // If their handshake is valid, send ours and wai for data.
+                                    // If their handshake is valid, send ours and wait for data.
                                     self.yamux.send_data(stream_id, &p.protocol.our_handshake)?;
-                                    p.our_stream = SubscriptionStreamState::Open { stream_id };
+                                    p.their_stream = SubscriptionStreamState::Open { stream_id };
 
                                     // If both sides are open then we notify the user that
                                     // the subscription is open and ready now.
                                     if p.our_stream.is_open() && p.their_stream.is_open() {
-                                        return Ok(Some(Message::Notification { 
-                                            protocol_id, 
-                                            res: SubscriptionResponse::Opened, 
+                                        return Ok(Some(Message::Notification {
+                                            protocol_id,
+                                            res: SubscriptionResponse::Opened,
                                         }))
                                     }
                                 } else {
