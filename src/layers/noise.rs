@@ -4,6 +4,7 @@ use crate::utils::peer_id::{Identity, PeerId, verify_ed25519};
 use crate::utils::protobuf;
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
+use alloc::vec;
 use alloc::vec::Vec;
 
 const NOISE_PARAMS: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
@@ -51,22 +52,24 @@ pub async fn handshake_dialer<S: AsyncStream, P: PlatformT>(
         .expect("has not been called previously")
         .build_initiator()?;
 
+    // Pre-allocate the buffer space we'll need. We do this on the heap to reduce
+    // the likelihood of stack overflows as they are fairly large.
+    let mut buf = vec![0u8; MAX_NOISE_MSG * 2];
+    let (buf_a, buf_b) = buf.split_at_mut(MAX_NOISE_MSG);
+
     // -- Message 1: -> e (empty payload) ------------------------------------
     {
-        let mut buf = [0u8; MAX_NOISE_MSG];
-        let len = noise.write_message(&[], &mut buf)?;
-        send_frame(&mut stream, &buf[..len]).await?;
+        let len = noise.write_message(&[], buf_a)?;
+        send_frame(&mut stream, &buf_a[..len]).await?;
     }
 
     // -- Message 2: <- e, ee, s, es (listener identity) ---------------------
     let noise_payload = {
-        let mut buf = [0u8; MAX_NOISE_MSG];
-        let len = recv_frame(&mut stream, &mut buf).await?;
-        let msg = &buf[..len];
+        let len = recv_frame(&mut stream, buf_a).await?;
+        let msg = &buf_a[..len];
 
-        let mut buf = [0u8; MAX_NOISE_MSG];
-        let len = noise.read_message(msg, &mut buf)?;
-        NoiseHandshakePayload::from_protobuf(&buf[..len])?
+        let len = noise.read_message(msg, buf_b)?;
+        NoiseHandshakePayload::from_protobuf(&buf_b[..len])?
     };
 
     // Verify the remote peer's identity.
@@ -90,18 +93,16 @@ pub async fn handshake_dialer<S: AsyncStream, P: PlatformT>(
 
     // -- Message 3: -> s, se (our identity) ---------------------------------
     {
-        let mut buf = [0u8; MAX_NOISE_MSG];
         let signed_msg: Vec<u8> = [STATIC_KEY_DOMAIN, dh_keys.public.as_slice()].concat();
         let len = NoiseHandshakePayload {
             key: identity.public_key_bytes(),
             signature: identity.sign(&signed_msg),
         }
-        .to_protobuf(&mut buf);
-        let msg = &buf[..len];
+        .to_protobuf(buf_a);
+        let msg = &buf_a[..len];
 
-        let mut buf = [0u8; MAX_NOISE_MSG];
-        let len = noise.write_message(msg, &mut buf)?;
-        send_frame(&mut stream, &buf[..len]).await?;
+        let len = noise.write_message(msg, buf_b)?;
+        send_frame(&mut stream, &buf_b[..len]).await?;
     }
 
     // Transition to transport mode.
