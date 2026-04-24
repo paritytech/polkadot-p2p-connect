@@ -972,12 +972,12 @@ mod test {
         let _ = block_on(yamux.next()); // OpenedByRemote
         let _ = block_on(yamux.next()); // Data
 
-        // Send GoAway with normal termination.
+        // Send GoAway with normal termination (must be on session stream 0).
         let goaway = YamuxHeader {
             version: 0,
             frame_type: FrameType::GoAway,
             flags: FrameFlags::empty(),
-            stream_id: YamuxStreamId::new(2),
+            stream_id: YamuxStreamId::new(0),
             length: GoAwayType::NormalTermination as u32,
         };
         handle.extend(goaway.encode());
@@ -1003,7 +1003,7 @@ mod test {
             version: 0,
             frame_type: FrameType::GoAway,
             flags: FrameFlags::empty(),
-            stream_id: YamuxStreamId::new(2),
+            stream_id: YamuxStreamId::new(0),
             length: GoAwayType::InternalError as u32,
         };
         handle.extend(goaway.encode());
@@ -1031,7 +1031,7 @@ mod test {
             version: 0,
             frame_type: FrameType::GoAway,
             flags: FrameFlags::empty(),
-            stream_id: YamuxStreamId::new(2),
+            stream_id: YamuxStreamId::new(0),
             length: GoAwayType::ProtocolError as u32,
         };
         handle.extend(goaway.encode());
@@ -1059,7 +1059,7 @@ mod test {
             version: 0,
             frame_type: FrameType::GoAway,
             flags: FrameFlags::empty(),
-            stream_id: YamuxStreamId::new(2),
+            stream_id: YamuxStreamId::new(0),
             length: 0xFF,
         };
         handle.extend(goaway.encode());
