@@ -1,6 +1,6 @@
 //! This crate is used to establish a peer-to-peer connection with a node on the Polkadot network.
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 #![deny(missing_docs)]
 
 extern crate alloc;

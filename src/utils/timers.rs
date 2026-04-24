@@ -91,4 +91,174 @@ impl<T, P: PlatformT> Timers<T, P> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use alloc::vec::Vec;
+    use core::cell::RefCell;
+    use std::sync::Mutex;
+
+    /// A sleep future whose readiness is controlled via a shared flag.
+    /// When polled while not ready, it stores the waker so that
+    /// `complete_sleep` can wake it — just like a real timer would.
+    struct MockSleep {
+        inner: Arc<MockSleepInner>,
+    }
+
+    struct MockSleepInner {
+        ready: AtomicBool,
+        waker: Mutex<Option<Waker>>,
+    }
+
+    impl core::future::Future for MockSleep {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.inner.ready.load(Ordering::Relaxed) {
+                return Poll::Ready(());
+            }
+            *self.inner.waker.lock().unwrap() = Some(cx.waker().clone());
+            // Re-check after storing waker to avoid missed wake.
+            if self.inner.ready.load(Ordering::Relaxed) {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    std::thread_local! {
+        static MOCK_SLEEPS: RefCell<Vec<Arc<MockSleepInner>>> = RefCell::new(Vec::new());
+    }
+
+    /// This test platform only impls sleep and hands back our [`MockSleep`] type,
+    /// which tests can manually resolve with [`complete_sleep`].
+    enum TestPlatform {}
+    impl PlatformT for TestPlatform {
+        type Sleep = MockSleep;
+
+        fn fill_with_random_bytes(_bytes: &mut [u8]) {
+            unimplemented!()
+        }
+        fn sleep(_duration: Duration) -> Self::Sleep {
+            let inner = Arc::new(MockSleepInner {
+                ready: AtomicBool::new(false),
+                waker: Mutex::new(None),
+            });
+            MOCK_SLEEPS.with(|sleeps| sleeps.borrow_mut().push(inner.clone()));
+            MockSleep { inner }
+        }
+    }
+
+    /// Mark the Nth mock sleep (0-indexed) as ready and wake its waker.
+    fn complete_sleep(index: usize) {
+        MOCK_SLEEPS.with(|sleeps| {
+            let sleeps = sleeps.borrow();
+            let inner = &sleeps[index];
+            inner.ready.store(true, Ordering::Relaxed);
+            if let Some(waker) = inner.waker.lock().unwrap().take() {
+                waker.wake();
+            }
+        });
+    }
+
+    fn reset_sleeps() {
+        MOCK_SLEEPS.with(|sleeps| sleeps.borrow_mut().clear());
+    }
+
+    #[test]
+    fn try_next_returns_none_when_empty() {
+        reset_sleeps();
+        let mut timers: Timers<u32, TestPlatform> = Timers::new(Duration::from_secs(1));
+        assert!(timers.try_next().is_none());
+    }
+
+    #[test]
+    fn returns_item_after_sleep_completes() {
+        reset_sleeps();
+        let mut timers: Timers<&str, TestPlatform> = Timers::new(Duration::from_secs(1));
+        timers.add("hello");
+
+        // Not ready yet.
+        assert!(timers.try_next().is_none());
+
+        // Mark the sleep as done.
+        complete_sleep(0);
+        assert_eq!(timers.try_next(), Some("hello"));
+
+        // Now empty again.
+        assert!(timers.try_next().is_none());
+    }
+
+    #[test]
+    fn fifo_order_when_all_complete() {
+        reset_sleeps();
+        let mut timers: Timers<u32, TestPlatform> = Timers::new(Duration::from_secs(1));
+        timers.add(1);
+        timers.add(2);
+        timers.add(3);
+
+        // Complete all sleeps.
+        complete_sleep(0);
+        complete_sleep(1);
+        complete_sleep(2);
+
+        assert_eq!(timers.try_next(), Some(1));
+        assert_eq!(timers.try_next(), Some(2));
+        assert_eq!(timers.try_next(), Some(3));
+        assert!(timers.try_next().is_none());
+    }
+
+    #[test]
+    fn blocked_until_front_completes() {
+        reset_sleeps();
+        let mut timers: Timers<u32, TestPlatform> = Timers::new(Duration::from_secs(1));
+        timers.add(1);
+        timers.add(2);
+
+        // Complete only the second sleep; front is still pending.
+        complete_sleep(1);
+        assert!(timers.try_next().is_none());
+
+        // Now complete the first.
+        complete_sleep(0);
+        assert_eq!(timers.try_next(), Some(1));
+        assert_eq!(timers.try_next(), Some(2));
+    }
+
+    #[test]
+    fn add_after_drain_works() {
+        reset_sleeps();
+        let mut timers: Timers<u32, TestPlatform> = Timers::new(Duration::from_secs(1));
+
+        timers.add(1);
+        complete_sleep(0);
+        assert_eq!(timers.try_next(), Some(1));
+        assert!(timers.try_next().is_none());
+
+        // Add another item after fully draining.
+        timers.add(2);
+        assert!(timers.try_next().is_none());
+        complete_sleep(1);
+        assert_eq!(timers.try_next(), Some(2));
+    }
+
+    #[test]
+    fn interleaved_add_and_drain() {
+        reset_sleeps();
+        let mut timers: Timers<u32, TestPlatform> = Timers::new(Duration::from_secs(1));
+
+        timers.add(1);
+        complete_sleep(0);
+        assert_eq!(timers.try_next(), Some(1));
+
+        // Add two more while empty.
+        timers.add(2);
+        timers.add(3);
+        complete_sleep(1);
+        assert_eq!(timers.try_next(), Some(2));
+
+        // Add another while 3 is still pending.
+        timers.add(4);
+        complete_sleep(2);
+        complete_sleep(3);
+        assert_eq!(timers.try_next(), Some(3));
+        assert_eq!(timers.try_next(), Some(4));
+    }
 }
