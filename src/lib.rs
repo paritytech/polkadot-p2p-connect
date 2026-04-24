@@ -778,7 +778,7 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                 // ----------------------------------
                 // Is this a message on a request stream that we are expecting a single response on?
                 // ----------------------------------
-                
+
                 let protocol_id = *protocol_id;
                 match info {
                     RequestState::AwaitingProtocolConfirmation(request) => {
@@ -865,22 +865,22 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
 
                 match output.state {
                     OutputState::Data(payload) => {
-                        return Ok(Some(Message::Request { 
-                            id: ResponseId(stream_id), 
-                            protocol_id, 
+                        return Ok(Some(Message::Request {
+                            id: ResponseId(stream_id),
+                            protocol_id,
                             req: Request::Value(payload),
                         }))
                     },
                     OutputState::Closed(CloseReason::ClosedByRemote) => {
                         return Ok(Some(Message::Request {
-                            id: ResponseId(stream_id), 
+                            id: ResponseId(stream_id),
                             protocol_id,
                             req: Request::Cancelled,
                         }))
                     },
                     OutputState::Closed(CloseReason::IncomingMessageTooLarge) => {
                         return Ok(Some(Message::Request {
-                            id: ResponseId(stream_id), 
+                            id: ResponseId(stream_id),
                             protocol_id,
                             req: Request::ErrorPayloadTooLarge,
                         }))
@@ -926,9 +926,9 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                                     // If both sides are open then we notify the user that
                                     // the subscription is open and ready now.
                                     if p.our_stream.is_open() && p.their_stream.is_open() {
-                                        return Ok(Some(Message::Notification { 
-                                            protocol_id, 
-                                            res: SubscriptionResponse::Opened, 
+                                        return Ok(Some(Message::Notification {
+                                            protocol_id,
+                                            res: SubscriptionResponse::Opened,
                                         }))
                                     }
                                 } else {
@@ -1097,8 +1097,8 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                     SubscriptionStreamState::Open { .. } => {
                         match output.state {
                             OutputState::Data(data) => {
-                                return Ok(Some(Message::Notification { 
-                                    protocol_id, 
+                                return Ok(Some(Message::Notification {
+                                    protocol_id,
                                     res: SubscriptionResponse::Value(data)
                                 }))
                             },
