@@ -117,7 +117,7 @@ impl PeerId {
             // Length of the remaining bytes must be 36.
             let digest_len =
                 varint::decode(cursor).map_err(PeerIdFromBase58Error::CannotDecodeVarint)?;
-            if cursor.len() != 36 && digest_len != 36 {
+            if cursor.len() != 36 || digest_len != 36 {
                 return Err(PeerIdFromBase58Error::WrongLength {
                     expected: 36,
                     actual: cursor.len(),

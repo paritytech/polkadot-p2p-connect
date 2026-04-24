@@ -99,7 +99,7 @@ impl AnyProtocol {
             AnyProtocol::Subscription(_) => None,
         }
     }
-    fn as_subcription(&self) -> Option<&SubscriptionProtocol> {
+    fn as_subscription(&self) -> Option<&SubscriptionProtocol> {
         match self {
             AnyProtocol::Request(_) => None,
             AnyProtocol::Subscription(p) => Some(p),
@@ -335,7 +335,7 @@ pub struct Connection<Stream, Platform: PlatformT> {
     incoming_requests: BTreeMap<YamuxStreamId, RequestProtocolId>,
     inflight_requests: BTreeMap<YamuxStreamId, (RequestProtocolId, RequestState)>,
     next_buf: VecDeque<Message>,
-    marker: PhantomData<(Platform,)>,
+    finished: bool,
 }
 
 enum RequestState {
@@ -545,7 +545,7 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
         let subscriptions = config
             .protocols
             .iter()
-            .filter_map(|(id, p)| p.as_subcription().map(|p| (id, p)))
+            .filter_map(|(id, p)| p.as_subscription().map(|p| (id, p)))
             .map(|(id, p)| SubscriptionDetails {
                 protocol_id: SubscriptionProtocolId(id.get()),
                 protocol: p.clone(),
@@ -575,7 +575,7 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
             inflight_requests: Default::default(),
             subscription_details: subscriptions,
             next_buf: Default::default(),
-            marker: PhantomData,
+            finished: false,
         })
     }
 
@@ -752,7 +752,21 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
 
     /// Drive this connection, making progress and returning messages as they are received.
     pub async fn next(&mut self) -> Option<Result<Message, StreamError>> {
-        self.next_inner().await.transpose()
+        if self.finished {
+            return None;
+        }
+
+        match self.next_inner().await {
+            Ok(None) => {
+                self.finished = true;
+                None
+            }
+            Err(e) => {
+                self.finished = true;
+                Some(Err(e))
+            }
+            Ok(Some(msg)) => Some(Ok(msg)),
+        }
     }
 
     async fn next_inner(&mut self) -> Result<Option<Message>, StreamError> {
@@ -1184,6 +1198,8 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
             let Some((protocol_id, _)) = self.inflight_requests.remove(&stream_id) else {
                 continue;
             };
+            // Abort the timed-out request stream, and emit a message.
+            self.yamux.reset_stream_immediately(stream_id);
             return Some(Message::Response {
                 id: RequestId(stream_id),
                 protocol_id,

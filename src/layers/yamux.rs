@@ -47,8 +47,6 @@ pub enum Error {
     ServerProtocolError,
     #[error("server sent a GO AWAY indicating some unspecified error with code {0}")]
     ServerUnknownError(u32),
-    #[error("called YamuxSession::next on a session which has failed already")]
-    AlreadyFailed,
 }
 
 /// This handles opening and closing multiple yamux streams on a single underlying [`AsyncStream`].
@@ -58,16 +56,9 @@ pub struct YamuxSession<S> {
     streams: BTreeMap<YamuxStreamId, StreamState>,
     // This could be on the stack but we want it to be MAX_FRAME_SIZE (ie 512kb)
     // in length so box it to reduce the chance of stack overflows.
-    inbound_buf: Box<[u8]>,
-    session_state: SessionState,
+    inbound_buf: Box<[u8; MAX_FRAME_SIZE]>,
+    finished: bool,
     output_buf: Option<InnerOutputState>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SessionState {
-    Open,
-    Failed,
-    Closed,
 }
 
 /// Some output about a stream.
@@ -134,7 +125,7 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
             // directly on the heap here to avoid possible stack overflows, but this
             // seems to be the case.
             inbound_buf: Box::new([0u8; MAX_FRAME_SIZE]),
-            session_state: SessionState::Open,
+            finished: false,
             output_buf: None,
         }
     }
@@ -145,10 +136,9 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
         let stream_id = self.next_stream_id;
         self.next_stream_id.increment();
 
-        // TODO: Right now we open streams and then can immediately push
-        // data to them before any ACK from the other side. Wait for acks
-        // first before sending any buffered messages to a stream? Yamux
-        // allows data to be sent before ACK so right now we don't look for one.
+        // Note: Right now we open streams and then can immediately push
+        // data to them before any ACK from the other side. Yamux allows
+        // data to be sent before ACK so right now we allow this.
         let stream = self
             .streams
             .entry(stream_id)
@@ -243,24 +233,18 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
     /// - Returns An error (and )
     pub async fn next(&mut self) -> Option<Result<Output<'_>, Error>> {
         // Don't progress if already errored or closed
-        match self.session_state {
-            SessionState::Closed => return None,
-            SessionState::Failed => {
-                return Some(Err(Error::AlreadyFailed));
-            }
-            SessionState::Open => {
-                // continue on.
-            }
+        if self.finished {
+            return None;
         }
 
         // Fetch the next output and handle errors
         let inner_state = match self.next_inner().await {
             Err(e) => {
-                self.session_state = SessionState::Failed;
+                self.finished = true;
                 return Some(Err(e));
             }
             Ok(None) => {
-                self.session_state = SessionState::Closed;
+                self.finished = true;
                 return None;
             }
             Ok(Some(inner_state)) => inner_state,
@@ -344,7 +328,9 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
                         continue;
                     }
 
-                    // Decrement the receive window given the data.
+                    // Decrement the receive window given the data. We don't care if they send more data
+                    // (though we'll error if MAX_FRAME_SIZE is exceeded, above) but do ensure to send them
+                    // window updates to allow them to keep sending data.
                     stream.recv_window = stream.recv_window.saturating_sub(data_len);
 
                     if flags.contains(FrameFlag::Rst) {
@@ -491,6 +477,11 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
                         self.inner
                             .write_all(&YamuxHeader::close_stream(stream_id).encode())
                             .await?;
+
+                        // Note: In theory we are sending FIN here which allows the other side
+                        // to continue sending data, but in practice we are happy to close it
+                        // entirely because at a higher level, we ignore any messages given back
+                        // on a closed stream since the protocol has ended successfully.
                         streams_to_remove.push(stream_id);
                     }
                     BufferedOutboundMessage::Reset => {
@@ -584,7 +575,7 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
         }
 
         // if they try to open too many streams, reject it but all good protocol wise.
-        if self.streams.len() > MAX_STREAMS {
+        if self.streams.len() >= MAX_STREAMS {
             self.inner
                 .write_all(&YamuxHeader::reset_stream(stream_id).encode())
                 .await?;
@@ -1141,7 +1132,7 @@ mod test {
     }
 
     #[test]
-    fn already_failed_after_error() {
+    fn none_after_error() {
         let stream = MockStream::new();
         let mut handle = stream.handle();
         let mut yamux = YamuxSession::new(stream);
@@ -1150,11 +1141,10 @@ mod test {
         handle.extend(YamuxHeader::open_stream(YamuxStreamId::new(3)).encode());
         let _ = block_on(yamux.next());
 
-        // Subsequent calls should return AlreadyFailed.
-        let res = block_on(yamux.next())
-            .expect("expecting output")
-            .expect("not None");
-        assert!(matches!(res, Err(Error::AlreadyFailed)));
+        // Subsequent calls should return None
+        let res = block_on(yamux.next()).expect("expecting output");
+
+        assert!(res.is_none());
     }
 
     #[test]

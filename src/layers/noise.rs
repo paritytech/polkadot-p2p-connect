@@ -4,7 +4,6 @@ use crate::utils::peer_id::{Identity, PeerId, verify_ed25519};
 use crate::utils::protobuf;
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
-use alloc::vec;
 use alloc::vec::Vec;
 
 const NOISE_PARAMS: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
@@ -54,13 +53,15 @@ pub async fn handshake_dialer<S: AsyncStream, P: PlatformT>(
 
     // Pre-allocate the buffer space we'll need. We do this on the heap to reduce
     // the likelihood of stack overflows as they are fairly large.
-    let mut buf = vec![0u8; MAX_NOISE_MSG * 2];
+    let mut buf = Box::new([0u8; MAX_NOISE_MSG * 2]);
     let (buf_a, buf_b) = buf.split_at_mut(MAX_NOISE_MSG);
+
+    let mut frame_sender = FrameSender::new();
 
     // -- Message 1: -> e (empty payload) ------------------------------------
     {
         let len = noise.write_message(&[], buf_a)?;
-        send_frame(&mut stream, &buf_a[..len]).await?;
+        frame_sender.send_frame(&mut stream, &buf_a[..len]).await?;
     }
 
     // -- Message 2: <- e, ee, s, es (listener identity) ---------------------
@@ -102,7 +103,7 @@ pub async fn handshake_dialer<S: AsyncStream, P: PlatformT>(
         let msg = &buf_a[..len];
 
         let len = noise.write_message(msg, buf_b)?;
-        send_frame(&mut stream, &buf_b[..len]).await?;
+        frame_sender.send_frame(&mut stream, &buf_b[..len]).await?;
     }
 
     // Transition to transport mode.
@@ -259,12 +260,28 @@ impl NoiseHandshakePayload {
 // Noise frame helpers (u16-BE length prefix)
 // ---------------------------------------------------------------------------
 
-async fn send_frame(stream: &mut impl AsyncStream, data: &[u8]) -> Result<(), async_stream::Error> {
-    let mut buf = [0u8; MAX_NOISE_MSG + 2];
-    buf[..2].copy_from_slice(&(data.len() as u16).to_be_bytes());
-    buf[2..data.len() + 2].copy_from_slice(data);
-    stream.write_all(&buf[..data.len() + 2]).await?;
-    Ok(())
+/// Send frames. Can re-use this to reuse an internal buffer.
+struct FrameSender {
+    buf: Box<[u8; MAX_NOISE_MSG + 2]>,
+}
+
+impl FrameSender {
+    fn new() -> Self {
+        Self {
+            buf: Box::new([0u8; MAX_NOISE_MSG + 2]),
+        }
+    }
+    async fn send_frame(
+        &mut self,
+        stream: &mut impl AsyncStream,
+        data: &[u8],
+    ) -> Result<(), async_stream::Error> {
+        let buf = &mut self.buf[..];
+        buf[..2].copy_from_slice(&(data.len() as u16).to_be_bytes());
+        buf[2..data.len() + 2].copy_from_slice(data);
+        stream.write_all(&buf[..data.len() + 2]).await?;
+        Ok(())
+    }
 }
 
 async fn recv_frame(
@@ -290,6 +307,11 @@ async fn recv_frame(
 pub struct NoiseStream<S> {
     inner: S,
     transport: snow::TransportState,
+    /// A small helper for sending frames.
+    frame_sender: FrameSender,
+    /// To avoid allocating on the stack too much we do one heap
+    /// allocation and use it to buffer bytes where needed.
+    intermediate_buf: Box<[u8; MAX_NOISE_MSG * 2]>,
     /// Buffer of decrypted plaintext not yet consumed by the caller.
     read_buf: VecDeque<u8>,
 }
@@ -299,6 +321,9 @@ impl<S> NoiseStream<S> {
         Self {
             inner,
             transport,
+            frame_sender: FrameSender::new(),
+            // 2 buffers worth of MAX_NOISE_MSG can be stored here:
+            intermediate_buf: Box::new([0u8; MAX_NOISE_MSG * 2]),
             read_buf: VecDeque::new(),
         }
     }
@@ -323,15 +348,17 @@ impl<S: AsyncStream> AsyncStream for NoiseStream<S> {
             } else {
                 //// If the internal buffer is empty then read another frame on the wire.
 
+                // Fetch a couple of buffers.
+                let (encrypted_buf, decrypted_buf) =
+                    self.intermediate_buf.split_at_mut(MAX_NOISE_MSG);
+
                 // Read a frame.
-                let mut encrypted_buf = [0u8; MAX_NOISE_MSG];
-                let frame_len = recv_frame(&mut self.inner, &mut encrypted_buf).await?;
+                let frame_len = recv_frame(&mut self.inner, encrypted_buf).await?;
 
                 // Decrypt them via snow
-                let mut decrypted_buf = [0u8; MAX_NOISE_MSG];
                 let decrypted_len = self
                     .transport
-                    .read_message(&encrypted_buf[..frame_len], &mut decrypted_buf)
+                    .read_message(&encrypted_buf[..frame_len], decrypted_buf)
                     .map_err(async_stream::Error::read_exact)?;
 
                 // Push them to our buffer
@@ -343,7 +370,7 @@ impl<S: AsyncStream> AsyncStream for NoiseStream<S> {
     }
 
     async fn write_all(&mut self, data: &[u8]) -> Result<(), async_stream::Error> {
-        let mut encrypt_buf = [0u8; MAX_NOISE_MSG];
+        let encrypt_buf = &mut self.intermediate_buf[0..MAX_NOISE_MSG];
         for chunk in data.chunks(MAX_PLAINTEXT) {
             // Encrypt each outgoing message.
             let encrypted_len = self
@@ -352,7 +379,9 @@ impl<S: AsyncStream> AsyncStream for NoiseStream<S> {
                 .map_err(async_stream::Error::write_all)?;
 
             // And then send it.
-            send_frame(&mut self.inner, &encrypt_buf[..encrypted_len]).await?;
+            self.frame_sender
+                .send_frame(&mut self.inner, &encrypt_buf[..encrypted_len])
+                .await?;
         }
         Ok(())
     }
