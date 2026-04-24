@@ -1181,7 +1181,7 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
             let Some(stream_id) = timeouts.try_next() else {
                 continue;
             };
-            let Some(protocol_id) = self.incoming_requests.remove(&stream_id) else {
+            let Some((protocol_id, _)) = self.inflight_requests.remove(&stream_id) else {
                 continue;
             };
             return Some(Message::Response {

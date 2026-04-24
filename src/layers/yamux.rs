@@ -59,8 +59,15 @@ pub struct YamuxSession<S> {
     // This could be on the stack but we want it to be MAX_FRAME_SIZE (ie 512kb)
     // in length so box it to reduce the chance of stack overflows.
     inbound_buf: Box<[u8]>,
-    failed: bool,
+    session_state: SessionState,
     output_buf: Option<InnerOutputState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionState {
+    Open,
+    Failed,
+    Closed,
 }
 
 /// Some output about a stream.
@@ -127,7 +134,7 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
             // directly on the heap here to avoid possible stack overflows, but this
             // seems to be the case.
             inbound_buf: Box::new([0u8; MAX_FRAME_SIZE]),
-            failed: false,
+            session_state: SessionState::Open,
             output_buf: None,
         }
     }
@@ -235,33 +242,46 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
     /// - Returns Some(Ok(id, bytes)) for each yamux frame we receive
     /// - Returns An error (and )
     pub async fn next(&mut self) -> Option<Result<Output<'_>, Error>> {
-        if self.failed {
-            return Some(Err(Error::AlreadyFailed));
+        // Don't progress if already errored or closed
+        match self.session_state {
+            SessionState::Closed => return None,
+            SessionState::Failed => {
+                return Some(Err(Error::AlreadyFailed));
+            }
+            SessionState::Open => {
+                // continue on.
+            }
         }
 
-        // If an error; mark failure so we stop pulling bytes etc.
-        let res = self.next_inner().await;
-        if res.is_err() {
-            self.failed = true;
-        }
+        // Fetch the next output and handle errors
+        let inner_state = match self.next_inner().await {
+            Err(e) => {
+                self.session_state = SessionState::Failed;
+                return Some(Err(e));
+            }
+            Ok(None) => {
+                self.session_state = SessionState::Closed;
+                return None;
+            }
+            Ok(Some(inner_state)) => inner_state,
+        };
 
-        // Now that we've done any mutation above, convert to our borrowing output.
-        res.transpose().map(|res| {
-            res.map(|inner_state| match inner_state {
-                InnerOutputState::OpenedByRemote(id) => Output {
-                    stream_id: id,
-                    state: OutputState::OpenedByRemote,
-                },
-                InnerOutputState::ClosedByRemote(id) => Output {
-                    stream_id: id,
-                    state: OutputState::ClosedByRemote,
-                },
-                InnerOutputState::Data(id, len) => Output {
-                    stream_id: id,
-                    state: OutputState::Data(&self.inbound_buf[..len]),
-                },
-            })
-        })
+        // Conver out output to the desired shape and return it
+        let output_state = match inner_state {
+            InnerOutputState::OpenedByRemote(id) => Output {
+                stream_id: id,
+                state: OutputState::OpenedByRemote,
+            },
+            InnerOutputState::ClosedByRemote(id) => Output {
+                stream_id: id,
+                state: OutputState::ClosedByRemote,
+            },
+            InnerOutputState::Data(id, len) => Output {
+                stream_id: id,
+                state: OutputState::Data(&self.inbound_buf[..len]),
+            },
+        };
+        Some(Ok(output_state))
     }
 
     // It's easier to return Result<Option> internally, but externally we want to look like
@@ -409,10 +429,12 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
                 FrameType::Ping => {
                     tracing::debug!(target: LOG_TARGET, "received PING on stream {stream_id} (flags: {flags})");
 
-                    // Ignore if stream has gone away.
-                    if !stream_id.is_session_id() && !self.streams.contains_key(&stream_id) {
+                    // Only stream 0 (session stream) should send this. If another stream
+                    // sends this then abort it as it did something wrong.
+                    if !stream_id.is_session_id() {
+                        self.reset_stream_immediately(stream_id);
                         continue;
-                    };
+                    }
 
                     // Return a pong to the ping.
                     tracing::debug!(target: LOG_TARGET, "sending PONG on stream {stream_id}");
@@ -423,10 +445,12 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
                 FrameType::GoAway => {
                     tracing::debug!(target: LOG_TARGET, "received GO AWAY on stream {stream_id} (flags: {flags})");
 
-                    // Ignore if stream not found (it may have gone away already)
-                    if !self.streams.contains_key(&stream_id) {
+                    // Only stream 0 (session stream) should send this. If another stream
+                    // sends this then abort it as it did something wrong.
+                    if !stream_id.is_session_id() {
+                        self.reset_stream_immediately(stream_id);
                         continue;
-                    };
+                    }
 
                     match GoAwayType::from_u32(hdr.length) {
                         // we're being told to go away due to an error:
@@ -726,9 +750,6 @@ mod test {
         let mut handle = stream.handle();
         let mut yamux = YamuxSession::new(stream);
 
-        // First open a stream so we have one active.
-        handle.extend(YamuxHeader::open_stream(YamuxStreamId::new(2)).encode());
-
         // Send a ping on the session ID (stream 0).
         let ping = YamuxHeader {
             version: 0,
@@ -739,14 +760,10 @@ mod test {
         };
         handle.extend(ping.encode());
 
-        // First drive: processes open_stream, returns OpenedByRemote.
-        let _ = block_on(yamux.next());
         // Second drive: processes ping, sends pong, returns Pending.
         let _ = block_on(yamux.next());
 
-        // We should have sent: accept stream, pong.
-        let accept = read_header(&mut handle);
-        assert_eq!(accept, YamuxHeader::accept_stream(YamuxStreamId::new(2)));
+        // We should have sent back a pong.
         let pong = read_header(&mut handle);
         assert_eq!(pong, YamuxHeader::pong(YamuxStreamId::new(0), 0xDEADBEEF));
     }
