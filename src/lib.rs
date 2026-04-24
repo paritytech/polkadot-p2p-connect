@@ -635,7 +635,9 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
             return;
         };
 
-        let _ = self.yamux.close_stream(id.0);
+        // RST the stream here because we want to abort and for the peer to not
+        // send anything back (which they are free to still do if FIN)
+        let _ = self.yamux.reset_stream_immediately(id.0);
         self.next_buf.push_back(Message::Response {
             id,
             protocol_id,
@@ -735,11 +737,13 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
             return;
         };
 
+        // Immediately abort any open streams here to tell the peer to also
+        // not send any further messages on them.
         if let Some(outgoing_stream_id) = p.our_stream.stream_id() {
-            let _ = self.yamux.close_stream(outgoing_stream_id);
+            let _ = self.yamux.reset_stream_immediately(outgoing_stream_id);
         };
         if let Some(incoming_stream_id) = p.their_stream.stream_id() {
-            let _ = self.yamux.close_stream(incoming_stream_id);
+            let _ = self.yamux.reset_stream_immediately(incoming_stream_id);
         };
 
         p.our_stream = SubscriptionStreamState::Closed;
@@ -804,7 +808,7 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                             // Close the stream and return the error to the user.
                             _ => {
                                 self.inflight_requests.remove(&stream_id);
-                                self.yamux.close_stream_immediately(stream_id);
+                                self.yamux.reset_stream_immediately(stream_id);
                                 return Ok(Some(Message::Response {
                                     id: RequestId(stream_id),
                                     protocol_id,
@@ -846,7 +850,7 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                             // Close the stream and return the error to the user.
                             _ => {
                                 self.inflight_requests.remove(&stream_id);
-                                self.yamux.close_stream_immediately(stream_id);
+                                self.yamux.reset_stream_immediately(stream_id);
                                 return Ok(Some(Message::Response {
                                     id: RequestId(stream_id),
                                     protocol_id,
@@ -888,7 +892,7 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                     _ => {
                         // Anything else is a protocol error. Just close and ignore
                         // this. We've removed the request from our map anyway.
-                        self.yamux.close_stream_immediately(stream_id);
+                        self.yamux.reset_stream_immediately(stream_id);
                     }
                 }
             } else if let Some(p) = self
@@ -1024,7 +1028,7 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                         // Only allow the inbound stream if we have opened ours
                         // already, or if we set allow_inbound to true.
                         if !p.protocol.allow_inbound && p.our_stream.is_closed() {
-                            self.yamux.close_stream_immediately(stream_id);
+                            self.yamux.reset_stream_immediately(stream_id);
                             continue
                         }
 
@@ -1156,7 +1160,7 @@ impl<Stream: AsyncStream, Platform: PlatformT> Connection<Stream, Platform> {
                     OutputState::OutgoingRejected
                     | OutputState::OutgoingAccepted(_)
                     | OutputState::Data(_) => {
-                        self.yamux.close_stream_immediately(output.stream_id);
+                        self.yamux.reset_stream_immediately(output.stream_id);
                     }
                     OutputState::Closed(_) => {
                         // Nothing to do; the now-unknown stream has closed.

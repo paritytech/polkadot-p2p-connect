@@ -207,6 +207,14 @@ impl<S: async_stream::AsyncStream> YamuxMultistream<S> {
         self.inner.close_stream_immediately(stream_id);
     }
 
+    /// Close a stream immediately, unbuffering any messages buffered to send prior to this call.
+    /// This works via the more aggressive RST flag to abort a stream and should be used in error
+    /// cases rather than general close cases.
+    pub fn reset_stream_immediately(&mut self, stream_id: YamuxStreamId) {
+        self.bufs.remove(&stream_id);
+        self.inner.reset_stream_immediately(stream_id);
+    }
+
     /// Drive our yamux multistream machine, returning output messages as they come in
     /// and pushing inputs out.
     pub async fn next(&mut self) -> Option<Result<Output, Error>> {
@@ -250,9 +258,9 @@ impl<S: async_stream::AsyncStream> YamuxMultistream<S> {
                         let Some(entry) = self.bufs.get_mut(&stream_id) else {
                             continue;
                         };
-                        // Close if buffer length exceeded.
+                        // Abort if buffer length exceeded.
                         if entry.buffer.len() + bytes.len() > entry.max_buffer_size {
-                            self.close_stream_immediately(stream_id);
+                            self.reset_stream_immediately(stream_id);
                             return Ok(Some(Output {
                                 stream_id,
                                 state: OutputState::Closed(CloseReason::IncomingMessageTooLarge),
@@ -313,7 +321,7 @@ impl<S: async_stream::AsyncStream> YamuxMultistream<S> {
                         )?;
                     } else {
                         tracing::debug!(target: LOG_TARGET, "new incoming stream {stream_id} invalid protocol suggestion: closing");
-                        self.close_stream_immediately(stream_id);
+                        self.reset_stream_immediately(stream_id);
                     }
                 }
                 // We've done the initial handshake and need to accept some protocol suggestion.
@@ -322,12 +330,12 @@ impl<S: async_stream::AsyncStream> YamuxMultistream<S> {
                     let mut protocol_bytes: Vec<u8> = byte_iter.collect();
                     if protocol_bytes.pop() != Some(b'\n') {
                         tracing::debug!(target: LOG_TARGET, "invalid multistream protocol (no trailing newline): request to close stream {stream_id}");
-                        self.close_stream_immediately(stream_id);
+                        self.reset_stream_immediately(stream_id);
                         continue;
                     }
                     let Ok(protocol_name) = String::from_utf8(protocol_bytes) else {
                         tracing::debug!(target: LOG_TARGET, "invalid multistream protocol (not utf8): request to close stream {stream_id}");
-                        self.close_stream_immediately(stream_id);
+                        self.reset_stream_immediately(stream_id);
                         continue;
                     };
 
@@ -345,7 +353,7 @@ impl<S: async_stream::AsyncStream> YamuxMultistream<S> {
                 MultistreamState::NewIncomingProtocolWaitingForAccept(_) => {
                     tracing::debug!(target: LOG_TARGET, "invalid multistream protocol (got bytes on stream waiting to be accepted): request to close stream {stream_id}");
                     drop(byte_iter);
-                    self.close_stream_immediately(stream_id);
+                    self.reset_stream_immediately(stream_id);
                     continue;
                 }
                 // We initiated an outgoing stream and are waiting for them to accept/reject
@@ -362,7 +370,7 @@ impl<S: async_stream::AsyncStream> YamuxMultistream<S> {
                             *seen_header = true;
                         } else {
                             tracing::debug!(target: LOG_TARGET, "invalid multistream header (2): request to close stream {stream_id}");
-                            self.close_stream_immediately(stream_id);
+                            self.reset_stream_immediately(stream_id);
                         }
                     } else {
                         // multistream header seen so we are just negotiating the protocol name
@@ -667,7 +675,7 @@ mod test {
         next_yamux_header(&mut handle);
         assert_eq!(
             next_yamux_header(&mut handle),
-            YamuxHeader::reject_stream(YamuxStreamId::new(2))
+            YamuxHeader::reset_stream(YamuxStreamId::new(2))
         );
     }
 

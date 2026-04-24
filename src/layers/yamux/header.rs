@@ -54,11 +54,22 @@ impl YamuxHeader {
     }
 
     /// Send an RST flag to terminate / reject a stream
-    pub fn reject_stream(stream_id: YamuxStreamId) -> Self {
+    pub fn reset_stream(stream_id: YamuxStreamId) -> Self {
         YamuxHeader {
             version: YAMUX_VERSION,
             frame_type: FrameType::WindowUpdate,
             flags: FrameFlag::Rst.into(),
+            stream_id: stream_id,
+            length: 0,
+        }
+    }
+
+    /// Send a FIN flag to indicate closure (peer can still send responses)
+    pub fn close_stream(stream_id: YamuxStreamId) -> Self {
+        YamuxHeader {
+            version: YAMUX_VERSION,
+            frame_type: FrameType::WindowUpdate,
+            flags: FrameFlag::Fin.into(),
             stream_id: stream_id,
             length: 0,
         }
@@ -326,8 +337,13 @@ mod test {
     }
 
     #[test]
-    fn roundtrip_reject_stream() {
-        roundtrip(YamuxHeader::reject_stream(YamuxStreamId(3)));
+    fn roundtrip_reset_stream() {
+        roundtrip(YamuxHeader::reset_stream(YamuxStreamId(3)));
+    }
+
+    #[test]
+    fn roundtrip_close_stream() {
+        roundtrip(YamuxHeader::close_stream(YamuxStreamId(3)));
     }
 
     #[test]

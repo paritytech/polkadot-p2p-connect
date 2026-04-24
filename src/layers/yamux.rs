@@ -101,6 +101,7 @@ enum BufferedOutboundMessage {
     Open,
     Data(VecDeque<u8>),
     Close,
+    Reset,
 }
 
 impl StreamState {
@@ -171,7 +172,9 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
                     .outbound_buf
                     .push_back(BufferedOutboundMessage::Data(data.into_iter().collect()));
             }
-            Some(BufferedOutboundMessage::Close) => return Err(Error::StreamNotFound(stream_id)),
+            Some(BufferedOutboundMessage::Close | BufferedOutboundMessage::Reset) => {
+                return Err(Error::StreamNotFound(stream_id));
+            }
         }
 
         Ok(())
@@ -208,6 +211,22 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
         stream
             .outbound_buf
             .push_back(BufferedOutboundMessage::Close);
+        stream.closed_by_us = true;
+    }
+
+    /// Schedule the stream to be closed immediately via the more aggressive RST flag. This ignores any
+    /// data scheduled to be sent and will close the stream as soon as [`Self::next()`] is called. No further
+    /// data will be seen for this stream.
+    pub fn reset_stream_immediately(&mut self, stream_id: YamuxStreamId) {
+        let Some(stream) = self.streams.get_mut(&stream_id) else {
+            // If we can't find the stream, it's been closed anyway.
+            return;
+        };
+
+        stream.outbound_buf.clear();
+        stream
+            .outbound_buf
+            .push_back(BufferedOutboundMessage::Reset);
         stream.closed_by_us = true;
     }
 
@@ -432,7 +451,7 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
 
     /// Send as much of our buffered data as we can until we run out of window size or data on each stream.
     async fn send_buffered_data(&mut self) -> Result<(), Error> {
-        let mut streams_to_close = vec![];
+        let mut streams_to_remove = vec![];
 
         for (&stream_id, stream) in &mut self.streams {
             while let Some(buffered_msg) = stream.outbound_buf.pop_front() {
@@ -444,11 +463,18 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
                             .await?;
                     }
                     BufferedOutboundMessage::Close => {
-                        tracing::debug!(target: LOG_TARGET, "closing stream {stream_id}");
+                        tracing::debug!(target: LOG_TARGET, "closing stream {stream_id} (FIN)");
                         self.inner
-                            .write_all(&YamuxHeader::reject_stream(stream_id).encode())
+                            .write_all(&YamuxHeader::close_stream(stream_id).encode())
                             .await?;
-                        streams_to_close.push(stream_id);
+                        streams_to_remove.push(stream_id);
+                    }
+                    BufferedOutboundMessage::Reset => {
+                        tracing::debug!(target: LOG_TARGET, "closing stream {stream_id} (RST)");
+                        self.inner
+                            .write_all(&YamuxHeader::reset_stream(stream_id).encode())
+                            .await?;
+                        streams_to_remove.push(stream_id);
                     }
                     BufferedOutboundMessage::Data(mut outbound_data) => {
                         let bytes_to_send = usize::min(stream.send_window, outbound_data.len());
@@ -503,9 +529,10 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
         }
 
         // Remove our stored stream info for any streams we've closed on our end.
-        for stream_id in streams_to_close {
+        for stream_id in streams_to_remove {
             self.streams.remove(&stream_id);
         }
+
         Ok(())
     }
 
@@ -526,7 +553,7 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
         // they should always send even stream ID numbers, and not the session ID number.
         if !stream_id.is_even() || stream_id.is_session_id() {
             self.inner
-                .write_all(&YamuxHeader::reject_stream(stream_id).encode())
+                .write_all(&YamuxHeader::reset_stream(stream_id).encode())
                 .await?;
             tracing::debug!(target: LOG_TARGET, "rejecting incoming stream {stream_id}: invalid stream ID");
             return Err(Error::InvalidStreamId(stream_id));
@@ -535,7 +562,7 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
         // if they try to open too many streams, reject it but all good protocol wise.
         if self.streams.len() > MAX_STREAMS {
             self.inner
-                .write_all(&YamuxHeader::reject_stream(stream_id).encode())
+                .write_all(&YamuxHeader::reset_stream(stream_id).encode())
                 .await?;
             tracing::debug!(target: LOG_TARGET, "rejecting incoming stream {stream_id}: too many open streams");
             return Ok(None);
@@ -544,7 +571,7 @@ impl<S: async_stream::AsyncStream> YamuxSession<S> {
         // If they send a duplicate stream ID, that is a protocol error so bail.
         if self.streams.contains_key(&stream_id) {
             self.inner
-                .write_all(&YamuxHeader::reject_stream(stream_id).encode())
+                .write_all(&YamuxHeader::reset_stream(stream_id).encode())
                 .await?;
             tracing::debug!(target: LOG_TARGET, "rejecting incoming stream {stream_id}: duplicate stream ID");
             return Err(Error::InvalidStreamId(stream_id));
@@ -1179,7 +1206,7 @@ mod test {
     }
 
     #[test]
-    fn close_stream_sends_rst() {
+    fn close_stream_sends_fin() {
         let stream = MockStream::new();
         let mut handle = stream.handle();
         let mut yamux = YamuxSession::new(stream);
@@ -1195,7 +1222,7 @@ mod test {
         // Second drive sends the Close (RST).
         let _ = block_on(yamux.next());
         let close_hdr = read_header(&mut handle);
-        assert_eq!(close_hdr, YamuxHeader::reject_stream(id));
+        assert_eq!(close_hdr, YamuxHeader::close_stream(id));
     }
 
     #[test]
@@ -1213,9 +1240,9 @@ mod test {
         // Drive the session.
         let _ = block_on(yamux.next());
 
-        // Should only see the RST, not the open or data.
+        // Should only see the FIN, not the open or data.
         let close_hdr = read_header(&mut handle);
-        assert_eq!(close_hdr, YamuxHeader::reject_stream(id));
+        assert_eq!(close_hdr, YamuxHeader::close_stream(id));
 
         // Nothing else should have been written.
         let remaining = handle.drain_all();
