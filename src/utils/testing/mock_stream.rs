@@ -73,15 +73,6 @@ impl MockStreamHandle {
         self.inner.borrow_mut().read_buf.push_back(byte);
     }
 
-    /*
-    /// Iterate over the byte in the buffer that is written too when [`MockStream::write_all`] is
-    /// used. This leaves them in place.
-    pub fn iter(&self) -> MockStreamWriteIter<'_> {
-        let inner = self.inner.borrow_mut();
-        MockStreamWriteIter { inner, pos: 0 }
-    }
-    */
-
     /// Drain `n` bytes from the buffer that is written too when [`MockStream::write_all`] is
     /// used, from the oldest to newest byte written.
     pub fn drain(&self, n: usize) -> Vec<u8> {
@@ -103,26 +94,3 @@ impl Extend<u8> for MockStreamHandle {
         }
     }
 }
-
-/*
-/// An iterator over the write buffer of a [`MockStream`].
-struct MockStreamWriteIter<'a> {
-    inner: core::cell::RefMut<'a, MockStreamInner>,
-    pos: usize,
-}
-
-impl <'a> Iterator for MockStreamWriteIter<'a> {
-    type Item = u8;
-    fn next(&mut self) -> Option<Self::Item> {
-        let next_byte = self.inner.write_buf.get(self.pos)?;
-        self.pos += 1;
-        Some(*next_byte)
-    }
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.inner.write_buf.len() - self.pos;
-        (remaining, Some(remaining))
-    }
-}
-
-impl <'a> ExactSizeIterator for MockStreamWriteIter<'a> {}
-*/

@@ -1,35 +1,38 @@
 use alloc::boxed::Box;
 
-/// Async byte-stream trait. The underlying peer connection (for instance TCP or WebSocket)
-/// should implement this, and then it can be passed to [`crate::Configuration::connect`]
-/// or similar to establish a connection to the peer.
-pub trait AsyncStream {
+/// This should be implemented by the read half of some stream.
+pub trait AsyncRead {
     /// Read enough bytes from the stream to fill the given buffer.
     fn read_exact(
         &mut self,
         buf: &mut [u8],
-    ) -> impl core::future::Future<Output = Result<(), Error>>;
-    /// Write the entirity of the given bytes to the stream.
-    fn write_all(&mut self, data: &[u8]) -> impl core::future::Future<Output = Result<(), Error>>;
+    ) -> impl core::future::Future<Output = Result<(), AsyncReadError>>;
 }
 
-/// Some error that has occurred reading or writing bytes from an implementation of [`AsyncStream`].
 #[derive(Debug, thiserror::Error)]
-#[allow(missing_docs)]
-pub enum Error {
-    #[error("cannot read from stream: {0}")]
-    ReadExact(Box<dyn core::error::Error + Send + Sync + 'static>),
-    #[error("cannot write to stream: {0}")]
-    WriteAll(Box<dyn core::error::Error + Send + Sync + 'static>),
+#[error("cannot read from stream: {0}")]
+pub struct AsyncReadError(Box<dyn core::error::Error + Send + Sync + 'static>);
+
+impl AsyncReadError {
+    /// Create an error relating to [`AsyncRead::read_exact`].
+    pub fn new<E: core::error::Error + Send + Sync + 'static>(e: E) -> AsyncReadError {
+        AsyncReadError(Box::new(e))
+    }
 }
 
-impl Error {
-    /// Create an error relating to [`AsyncStream::read_exact`].
-    pub fn read_exact<E: core::error::Error + Send + Sync + 'static>(e: E) -> Error {
-        Error::ReadExact(Box::new(e))
-    }
+/// This should be implemented by the write half of some stream.
+pub trait AsyncWrite {
+    /// Write the entirity of the given bytes to the stream.
+    fn write_all(&mut self, data: &[u8]) -> impl core::future::Future<Output = Result<(), AsyncWriteError>>;
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("cannot write to stream: {0}")]
+pub struct AsyncWriteError(Box<dyn core::error::Error + Send + Sync + 'static>);
+
+impl AsyncWriteError {
     /// Create an error relating to [`AsyncStream::write_all`].
-    pub fn write_all<E: core::error::Error + Send + Sync + 'static>(e: E) -> Error {
-        Error::WriteAll(Box::new(e))
+    pub fn new<E: core::error::Error + Send + Sync + 'static>(e: E) -> AsyncWriteError {
+        AsyncWriteError(Box::new(e))
     }
 }

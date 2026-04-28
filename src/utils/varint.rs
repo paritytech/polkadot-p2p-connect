@@ -1,10 +1,10 @@
-use crate::utils::async_stream::{self, AsyncStream};
+use crate::utils::async_stream::{AsyncRead, AsyncReadError};
 use alloc::vec::Vec;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("stream error reading varint: {0}")]
-    Stream(#[from] async_stream::Error),
+    Stream(#[from] AsyncReadError),
     #[error("varint is too large")]
     OutOfRange,
     #[error("ran out of input decoding varint")]
@@ -69,7 +69,7 @@ pub fn decode(bytes: &mut &[u8]) -> Result<u64, Error> {
 }
 
 /// Read an unsigned varint from an async stream, one byte at a time.
-pub async fn decode_from_stream(stream: &mut impl AsyncStream) -> Result<u64, Error> {
+pub async fn decode_from_stream(stream: &mut impl AsyncRead) -> Result<u64, Error> {
     let mut decoder = Decoder::new();
     loop {
         // Read a byte

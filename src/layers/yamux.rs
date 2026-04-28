@@ -27,8 +27,10 @@ const MAX_FRAME_SIZE: usize = 512 * 1024; // 512kb
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("stream error sending or receiving bytes: {0}")]
-    AsyncStream(#[from] async_stream::Error),
+    #[error("stream error receiving bytes: {0}")]
+    AsyncRead(#[from] async_stream::AsyncReadError),
+    #[error("stream error sending bytes: {0}")]
+    AsyncWrite(#[from] async_stream::AsyncWriteError),
     #[error("cannot decode yamux header: {0}")]
     YamuxHeaderDecodeError(#[from] YamuxHeaderDecodeError),
     #[error("client tried to send message on stream ID {0}, which has been closed")]
@@ -50,8 +52,10 @@ pub enum Error {
 }
 
 /// This handles opening and closing multiple yamux streams on a single underlying [`AsyncStream`].
-pub struct YamuxSession<S> {
-    inner: S,
+pub struct YamuxSession<R, W> {
+    // AsyncReader and AsyncWriter:
+    writer: W,
+    reader: R,
     next_stream_id: YamuxStreamId,
     streams: BTreeMap<YamuxStreamId, StreamState>,
     // This could be on the stack but we want it to be MAX_FRAME_SIZE (ie 512kb)
@@ -114,11 +118,12 @@ impl StreamState {
     }
 }
 
-impl<S: async_stream::AsyncStream> YamuxSession<S> {
+impl<R: async_stream::AsyncRead, W: async_stream::AsyncWrite> YamuxSession<R, W> {
     /// Create a new, empty Yamux session, given some internal read/write transport.
-    pub fn new(stream: S) -> Self {
+    pub fn new(reader: R, writer: W) -> Self {
         Self {
-            inner: stream,
+            reader,
+            writer,
             next_stream_id: YamuxStreamId::first(),
             streams: BTreeMap::new(),
             // We rely on the compiler eliding the stack allocating and allocating
