@@ -234,14 +234,13 @@ impl<R: async_stream::AsyncRead + 'static, W: async_stream::AsyncWrite + 'static
 
                 (stream_id, entry)
             } else {
-                let output = match self.inner.next().await {
+                let yamux::Output { stream_id, state } = match self.inner.next().await {
                     Some(Ok(out)) => out,
                     Some(Err(e)) => return Err(Error::Yamux(e)),
                     None => return Ok(None),
                 };
 
-                let stream_id = output.stream_id;
-                let entry = match output.state {
+                let entry = match state {
                     yamux::OutputState::OpenedByRemote => {
                         // New stream opened; add it to our map.
                         tracing::debug!(target: LOG_TARGET, "stream {stream_id} opened by remote");
@@ -253,21 +252,25 @@ impl<R: async_stream::AsyncRead + 'static, W: async_stream::AsyncWrite + 'static
                             max_buffer_size: MULTISTREAM_PROTOCOL_MAX_LEN,
                         })
                     }
-                    yamux::OutputState::Data(bytes) => {
+                    yamux::OutputState::Data(_len) => {
                         // Data on new stream; buffer the data and ignore if we don't know the stream.
                         let Some(entry) = self.bufs.get_mut(&stream_id) else {
                             continue;
                         };
+
+                        let data = self.inner.data();
+
                         // Abort if buffer length exceeded.
-                        if entry.buffer.len() + bytes.len() > entry.max_buffer_size {
-                            // drop(state);
+                        if entry.buffer.len() + data.len() > entry.max_buffer_size {
+                            drop(data);
                             self.reset_stream_immediately(stream_id);
                             return Ok(Some(Output {
                                 stream_id,
                                 state: OutputState::Closed(CloseReason::IncomingMessageTooLarge),
                             }));
                         }
-                        entry.buffer.feed(&bytes);
+
+                        entry.buffer.feed(&data);
                         entry
                     }
                     yamux::OutputState::ClosedByRemote => {

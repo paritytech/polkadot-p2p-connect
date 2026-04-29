@@ -9,6 +9,7 @@ pub trait AsyncRead {
     ) -> impl core::future::Future<Output = Result<(), AsyncReadError>>;
 }
 
+/// An error that can occur when calling [`AsyncRead::read_exact`].
 #[derive(Debug, thiserror::Error)]
 #[error("cannot read from stream: {0}")]
 pub struct AsyncReadError(Box<dyn core::error::Error + Send + Sync + 'static>);
@@ -26,6 +27,7 @@ pub trait AsyncWrite {
     fn write_all(&mut self, data: &[u8]) -> impl core::future::Future<Output = Result<(), AsyncWriteError>>;
 }
 
+/// An error that can occur when calling [`AsyncWrite::write_all`].
 #[derive(Debug, thiserror::Error)]
 #[error("cannot write to stream: {0}")]
 pub struct AsyncWriteError(Box<dyn core::error::Error + Send + Sync + 'static>);
