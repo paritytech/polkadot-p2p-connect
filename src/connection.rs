@@ -29,6 +29,20 @@ pub struct Connection<R, W, Platform: PlatformT> {
     finished: bool,
 }
 
+// SAFETY: `Connection` is not `Send` by default because some `Rc<RefCell<..>>`
+// Types exist internally. 
+//
+// We would have an issue if it were possible to get hold of any clones of `Rc`s and then send 
+// `Connection` to a different thread, leaving an Rc split across two threads. (This is an issue
+// because the Rc cannot atomically update its reference count, and the inner RefCell cannot 
+// atomically set its borrowed flag or atomically share the inner data).
+//
+// HOWEVER, since no Rc/RefCell type is exposed in the public API of `Connection`, it is 
+// impossible to end up in a position where any Rc type is split across two threads: they are
+// all entirely contained in whichever thread the `Connection` is on.
+unsafe impl<R: Send, W: Send, Platform: Send + PlatformT> Send
+    for Connection<R, W, Platform> {}
+
 enum RequestState {
     AwaitingProtocolConfirmation(Vec<u8>),
     AwaitingResponsePayload,
@@ -458,7 +472,8 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static, Platform: PlatformT> Conne
     /// 
     /// # Cancel safety
     /// 
-    /// This method is not cancel safe.
+    /// This method is cancel safe. This is important, because you may with to interrupt waiting
+    /// for the next message in order to issue a command.
     pub async fn next(&mut self) -> Option<Result<Message, StreamError>> {
         if self.finished {
             return None;
@@ -959,8 +974,8 @@ mod test {
             }
         }
 
-        // fn assert_send<T: Send>() {}
-        // assert_send::<Connection<TestStreamStub, TestPlatformStub>>();
+        fn assert_send<T: Send>() {}
+        assert_send::<Connection<TestStreamStub, TestStreamStub, TestPlatformStub>>();
     }
 
 
