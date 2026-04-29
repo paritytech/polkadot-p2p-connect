@@ -353,11 +353,16 @@ impl<R: async_stream::AsyncRead + 'static, W: async_stream::AsyncWrite + 'static
     }
 
     async fn read_next(
-        reader: &mut R, 
-        shared_state: &RefCell<SharedState>, 
+        reader: &mut R,
+        shared_state: &RefCell<SharedState>,
         buf: &mut [u8; MAX_FRAME_SIZE]
     ) -> Result<Option<Output>, Error> {
         loop {
+            // Check if a buffered output is waiting (e.g. Data queued after OpenedByRemote).
+            if let Some(output) = shared_state.borrow_mut().output_buf.take() {
+                return Ok(Some(output));
+            }
+
             // We first download and decode the header:
             let hdr = {
                 let mut hdr_buf = [0u8; YamuxHeader::SIZE];
@@ -535,7 +540,7 @@ impl<R: async_stream::AsyncRead + 'static, W: async_stream::AsyncWrite + 'static
         }
     }
 
-    /// Send as much of our buffered data as we can until we run out of window size or data on each stream.
+    /// Send as much of our buffered data as we can, draining any write buffers.
     async fn write_next(
         writer: &mut W, 
         shared_state: &RefCell<SharedState>
@@ -641,11 +646,13 @@ impl<R: async_stream::AsyncRead + 'static, W: async_stream::AsyncWrite + 'static
         }
 
         drop(shared_state);
-        
+
         // Perform a single write at the end with everything, to:
         // a) avoid holding onto our shared state across an await point,
         // b) can be more efficient doing one write instead of many.
-        writer.write_all(&bytes_to_write).await?;
+        if !bytes_to_write.is_empty() {
+            writer.write_all(&bytes_to_write).await?;
+        }
 
         Ok(())
     }
@@ -705,7 +712,7 @@ mod test {
     };
 
     /// Poll the [`YamuxSession`], expecting it to return an [`Output`].
-    fn next_expecting_output<R: AsyncRead, W: AsyncWrite>(yamux: &mut YamuxSession<R, W>) -> Output {
+    fn next_expecting_output<R: AsyncRead + 'static, W: AsyncWrite + 'static>(yamux: &mut YamuxSession<R, W>) -> Output {
         block_on(yamux.next())
             .expect("expecting Ready, not Pending, from YamuxSession::next()")
             .expect("output should not be None")
@@ -733,7 +740,7 @@ mod test {
         // 20 of these on the stack should be ok. We have this test because
         // it's easily possible to have large stack buffers to handle everything,
         // and this was causing issues earlier so we allocate a bit more to the heap.
-        let _: [YamuxSession<MockStream>; _] = [
+        let _: [YamuxSession<MockStream, MockStream>; _] = [
             y(),
             y(),
             y(),
@@ -781,7 +788,8 @@ mod test {
         // Second next() returns the data.
         let res = next_expecting_output(&mut yamux);
         assert_eq!(res.stream_id, YamuxStreamId::new(2));
-        assert_eq!(res.state, OutputState::Data(data));
+        assert_eq!(res.state, OutputState::Data(data.len()));
+        assert_eq!(&*yamux.data(), data as &[u8]);
 
         // If we call next() again we'll get Pending back as we're waiting for more data
         assert!(block_on(yamux.next()).is_none());
@@ -818,7 +826,8 @@ mod test {
         // Second next() returns the data.
         let res = next_expecting_output(&mut yamux);
         assert_eq!(res.stream_id, YamuxStreamId::new(2));
-        assert_eq!(res.state, OutputState::Data(data));
+        assert_eq!(res.state, OutputState::Data(data.len()));
+        assert_eq!(&*yamux.data(), data as &[u8]);
 
         // If we call next() again we'll get Pending back as we're waiting for more data
         assert!(block_on(yamux.next()).is_none());
@@ -877,7 +886,8 @@ mod test {
         // Second next() returns the data.
         let res = next_expecting_output(&mut yamux);
         assert_eq!(res.stream_id, YamuxStreamId::new(2));
-        assert_eq!(res.state, OutputState::Data(data));
+        assert_eq!(res.state, OutputState::Data(data.len()));
+        assert_eq!(&*yamux.data(), data as &[u8]);
 
         // Third next() returns ClosedByRemote (buffered from FIN).
         let res = next_expecting_output(&mut yamux);
@@ -914,7 +924,8 @@ mod test {
         // Second next() returns the data.
         let res = next_expecting_output(&mut yamux);
         assert_eq!(res.stream_id, YamuxStreamId::new(2));
-        assert_eq!(res.state, OutputState::Data(data));
+        assert_eq!(res.state, OutputState::Data(data.len()));
+        assert_eq!(&*yamux.data(), data as &[u8]);
 
         // Third next() returns ClosedByRemote (buffered from RST).
         let res = next_expecting_output(&mut yamux);
@@ -1183,7 +1194,8 @@ mod test {
         // Second call: returns the data from the FIN frame.
         let res = next_expecting_output(&mut yamux);
         assert_eq!(res.stream_id, YamuxStreamId::new(2));
-        assert_eq!(res.state, OutputState::Data(data));
+        assert_eq!(res.state, OutputState::Data(data.len()));
+        assert_eq!(&*yamux.data(), data as &[u8]);
 
         // Third call: returns ClosedByRemote (buffered from FIN).
         let res = next_expecting_output(&mut yamux);
@@ -1370,7 +1382,8 @@ mod test {
         // Second next: stream 2 data.
         let res = next_expecting_output(&mut yamux);
         assert_eq!(res.stream_id, YamuxStreamId::new(2));
-        assert_eq!(res.state, OutputState::Data(data_a));
+        assert_eq!(res.state, OutputState::Data(data_a.len()));
+        assert_eq!(&*yamux.data(), data_a as &[u8]);
 
         // Third next: stream 4 opened.
         let res = next_expecting_output(&mut yamux);
@@ -1380,7 +1393,8 @@ mod test {
         // Fourth next: stream 4 data.
         let res = next_expecting_output(&mut yamux);
         assert_eq!(res.stream_id, YamuxStreamId::new(4));
-        assert_eq!(res.state, OutputState::Data(data_b));
+        assert_eq!(res.state, OutputState::Data(data_b.len()));
+        assert_eq!(&*yamux.data(), data_b as &[u8]);
     }
 
     #[test]
@@ -1404,7 +1418,8 @@ mod test {
         // Second next: should skip the zero-length frame and return the real data.
         let res = next_expecting_output(&mut yamux);
         assert_eq!(res.stream_id, YamuxStreamId::new(2));
-        assert_eq!(res.state, OutputState::Data(data));
+        assert_eq!(res.state, OutputState::Data(data.len()));
+        assert_eq!(&*yamux.data(), data as &[u8]);
     }
 
     #[test]
@@ -1433,6 +1448,7 @@ mod test {
             .expect("not None")
             .expect("not Err");
         assert_eq!(res.stream_id, YamuxStreamId::new(2));
-        assert_eq!(res.state, OutputState::Data(data2));
+        assert_eq!(res.state, OutputState::Data(data2.len()));
+        assert_eq!(&*yamux.data(), data2 as &[u8]);
     }
 }

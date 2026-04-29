@@ -115,18 +115,8 @@ pub async fn handshake_dialer<R: AsyncRead, W: AsyncWrite, P: PlatformT>(
     let transport = Rc::new(RefCell::new(noise.into_transport_mode()?));
 
     // Create our read/write pair.
-    let reader = NoiseReadStream {
-        reader,
-        intermediate_buf: Box::new([0u8; MAX_NOISE_MSG * 2]),
-        read_buf: Default::default(),
-        transport: transport.clone(),
-    };
-    let writer = NoiseWriteStream {
-        writer,
-        frame_sender: FrameSender::new(),
-        intermediate_buf: Box::new([0u8; MAX_NOISE_MSG]),
-        transport,
-    };
+    let reader = NoiseReadStream::new(reader, transport.clone());
+    let writer = NoiseWriteStream::new(writer, transport);
 
     Ok((reader, writer, remote_peer_id))
 }
@@ -145,6 +135,17 @@ pub struct NoiseReadStream<R> {
     /// Noise transport state. Shared between reader and writer, so
     /// must be careful not to borrow across await points.
     transport: Rc<RefCell<snow::TransportState>>,
+}
+
+impl<R: AsyncRead> NoiseReadStream<R> {
+    fn new(reader: R, transport: Rc<RefCell<snow::TransportState>>) -> Self {
+        NoiseReadStream {
+            reader,
+            intermediate_buf: Box::new([0u8; MAX_NOISE_MSG * 2]),
+            read_buf: Default::default(),
+            transport,
+        }
+    }
 }
 
 impl<R: AsyncRead> AsyncRead for NoiseReadStream<R> {
@@ -199,6 +200,17 @@ pub struct NoiseWriteStream<W> {
     /// Noise transport state. Shared between reader and writer, so
     /// must be careful not to borrow across await points.
     transport: Rc<RefCell<snow::TransportState>>,
+}
+
+impl<W: AsyncWrite> NoiseWriteStream<W> {
+    fn new(writer: W, transport: Rc<RefCell<snow::TransportState>>) -> Self {
+        NoiseWriteStream {
+            writer,
+            frame_sender: FrameSender::new(),
+            intermediate_buf: Box::new([0u8; MAX_NOISE_MSG]),
+            transport,
+        }
+    }
 }
 
 impl<W: AsyncWrite> AsyncWrite for NoiseWriteStream<W> {
@@ -478,7 +490,7 @@ mod test {
 
     /// Perform a Noise XX handshake entirely in memory and return a
     /// (initiator, responder) pair of `TransportState`s ready for data.
-    fn make_transport_pair() -> (snow::TransportState, snow::TransportState) {
+    fn make_transport_pair() -> (Rc<RefCell<snow::TransportState>>, Rc<RefCell<snow::TransportState>>) {
         let params: snow::params::NoiseParams = NOISE_PARAMS.parse().unwrap();
 
         let builder_i = snow::Builder::with_resolver(params.clone(), Box::new(test_resolver()));
@@ -518,8 +530,8 @@ mod test {
         responder.read_message(&msg3, &mut tmp).unwrap();
 
         (
-            initiator.into_transport_mode().unwrap(),
-            responder.into_transport_mode().unwrap(),
+            Rc::new(RefCell::new(initiator.into_transport_mode().unwrap())),
+            Rc::new(RefCell::new(responder.into_transport_mode().unwrap())),
         )
     }
 
@@ -530,14 +542,14 @@ mod test {
         let plaintext = b"hello, noise!";
         let writer_mock = MockStream::new();
         let writer_handle = writer_mock.handle();
-        let mut writer = NoiseStream::new(writer_mock, ti);
+        let mut writer = NoiseWriteStream::new(writer_mock, ti);
         block_on(writer.write_all(plaintext)).unwrap();
 
         let wire = writer_handle.drain_all();
         let reader_mock = MockStream::new();
         let mut reader_handle = reader_mock.handle();
         reader_handle.extend(wire);
-        let mut reader = NoiseStream::new(reader_mock, tr);
+        let mut reader = NoiseReadStream::new(reader_mock, tr);
 
         let mut out = vec![0u8; plaintext.len()];
         block_on(reader.read_exact(&mut out)).unwrap();
@@ -551,14 +563,14 @@ mod test {
         let plaintext: Vec<u8> = (0..MAX_PLAINTEXT).map(|i| (i % 256) as u8).collect();
         let writer_mock = MockStream::new();
         let writer_handle = writer_mock.handle();
-        let mut writer = NoiseStream::new(writer_mock, ti);
+        let mut writer = NoiseWriteStream::new(writer_mock, ti);
         block_on(writer.write_all(&plaintext)).unwrap();
 
         let wire = writer_handle.drain_all();
         let reader_mock = MockStream::new();
         let mut reader_handle = reader_mock.handle();
         reader_handle.extend(wire);
-        let mut reader = NoiseStream::new(reader_mock, tr);
+        let mut reader = NoiseReadStream::new(reader_mock, tr);
 
         let mut out = vec![0u8; plaintext.len()];
         block_on(reader.read_exact(&mut out)).unwrap();
@@ -575,14 +587,14 @@ mod test {
             .collect();
         let writer_mock = MockStream::new();
         let writer_handle = writer_mock.handle();
-        let mut writer = NoiseStream::new(writer_mock, ti);
+        let mut writer = NoiseWriteStream::new(writer_mock, ti);
         block_on(writer.write_all(&plaintext)).unwrap();
 
         let wire = writer_handle.drain_all();
         let reader_mock = MockStream::new();
         let mut reader_handle = reader_mock.handle();
         reader_handle.extend(wire);
-        let mut reader = NoiseStream::new(reader_mock, tr);
+        let mut reader = NoiseReadStream::new(reader_mock, tr);
 
         let mut out = vec![0u8; plaintext.len()];
         block_on(reader.read_exact(&mut out)).unwrap();
@@ -596,14 +608,14 @@ mod test {
         let plaintext = b"abcdefghij"; // 10 bytes in one frame
         let writer_mock = MockStream::new();
         let writer_handle = writer_mock.handle();
-        let mut writer = NoiseStream::new(writer_mock, ti);
+        let mut writer = NoiseWriteStream::new(writer_mock, ti);
         block_on(writer.write_all(plaintext)).unwrap();
 
         let wire = writer_handle.drain_all();
         let reader_mock = MockStream::new();
         let mut reader_handle = reader_mock.handle();
         reader_handle.extend(wire);
-        let mut reader = NoiseStream::new(reader_mock, tr);
+        let mut reader = NoiseReadStream::new(reader_mock, tr);
 
         // Read 4 bytes (leaves 6 buffered)
         let mut first = [0u8; 4];
@@ -622,7 +634,7 @@ mod test {
 
         let writer_mock = MockStream::new();
         let writer_handle = writer_mock.handle();
-        let mut writer = NoiseStream::new(writer_mock, ti);
+        let mut writer = NoiseWriteStream::new(writer_mock, ti);
         block_on(writer.write_all(b"first")).unwrap();
         block_on(writer.write_all(b"second")).unwrap();
         block_on(writer.write_all(b"third")).unwrap();
@@ -631,7 +643,7 @@ mod test {
         let reader_mock = MockStream::new();
         let mut reader_handle = reader_mock.handle();
         reader_handle.extend(wire);
-        let mut reader = NoiseStream::new(reader_mock, tr);
+        let mut reader = NoiseReadStream::new(reader_mock, tr);
 
         // 5 + 6 + 5 = 16 bytes total across three frames, read all at once
         let mut out = vec![0u8; 16];
@@ -645,7 +657,7 @@ mod test {
 
         let writer_mock = MockStream::new();
         let writer_handle = writer_mock.handle();
-        let mut writer = NoiseStream::new(writer_mock, ti);
+        let mut writer = NoiseWriteStream::new(writer_mock, ti);
         block_on(writer.write_all(b"AAA")).unwrap(); // frame 1: 3 bytes
         block_on(writer.write_all(b"BBBBB")).unwrap(); // frame 2: 5 bytes
 
@@ -653,7 +665,7 @@ mod test {
         let reader_mock = MockStream::new();
         let mut reader_handle = reader_mock.handle();
         reader_handle.extend(wire);
-        let mut reader = NoiseStream::new(reader_mock, tr);
+        let mut reader = NoiseReadStream::new(reader_mock, tr);
 
         // Read 5 bytes: spans frame 1 (3 bytes) then starts frame 2 (2 bytes)
         let mut out = [0u8; 5];
@@ -673,7 +685,7 @@ mod test {
         let plaintext = b"this should be encrypted on the wire";
         let writer_mock = MockStream::new();
         let writer_handle = writer_mock.handle();
-        let mut writer = NoiseStream::new(writer_mock, ti);
+        let mut writer = NoiseWriteStream::new(writer_mock, ti);
         block_on(writer.write_all(plaintext)).unwrap();
 
         // Skip the 2-byte length prefix; the encrypted payload must not contain
@@ -689,7 +701,7 @@ mod test {
 
         let writer_mock = MockStream::new();
         let writer_handle = writer_mock.handle();
-        let mut writer = NoiseStream::new(writer_mock, ti);
+        let mut writer = NoiseWriteStream::new(writer_mock, ti);
         block_on(writer.write_all(b"")).unwrap();
 
         // chunks(MAX_PLAINTEXT) on an empty slice yields no chunks,

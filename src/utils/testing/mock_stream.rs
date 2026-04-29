@@ -6,7 +6,7 @@ use core::cell::RefCell;
 
 /// A Mock stream implementation which implements [`AsyncStream`] and can
 /// be used in single threaded contexts for exampels and testing.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct MockStream {
     inner: Rc<RefCell<MockStreamInner>>,
 }
