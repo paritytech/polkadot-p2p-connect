@@ -1,6 +1,6 @@
 # polkadot-p2p-connector
 
-This is a no-std compatible library for communicating with peers on the Polkadot network. Being no-std, it can be wired up to work in the browser, run natively using tokio, or other. It is focused on connecting to a single peer and interacting with it. Other libraries could use this under the hood to manage multiple peer connections.
+This is a no-std compatible library for communicating with peers on the Polkadot network. Being no-std, it can be wired up to work in the browser, run natively using tokio, or other. It is focused on connecting to a single peer and interacting with it.
 
 Here's an example of subscribing to block announcements from a peer:
 
@@ -148,6 +148,12 @@ Connecting to a peer on the polkadot network essentially involves these steps:
 Given some way to read and write bytes to a stream (denoted by the `AsyncRead` and `AsyncWrite` traits), and a basic `Platform` implementation to provide some key functionality, this library handles all of the above steps and provides an API to request or subscribe on different protocols.
 
 # FAQ
+
+## Why would I use this over something like `litep2p`?
+
+Litep2p is not no-std compatible, and operates at a higher level, managing multiple peer connections under the hood. This library is no-std compatible and thus better suited as the base for a light client implementation as it can run in a browser environment via WASM, and operates at a lower level, focusing on single peer connections.
+
+The idea is that, with this library, you can then decide how to manage multiple peer connections (ie spawning each connection to a different task or multiplexing many on a single task) and decide when to drop connections.
 
 ## Why do I have to provide implementations for things like `PlatformT`, `AsyncRead` and `AsyncWrite`?
 

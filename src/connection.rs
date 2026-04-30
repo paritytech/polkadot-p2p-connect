@@ -311,8 +311,13 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static, Platform: PlatformT> Conne
         &self.remote_id
     }
 
-    /// Make a request to some protocol name (essentially the unique ID/path for the request) and request body.
-    /// This returns a [`RequestId`]. We will get back exactly one response using this ID from [`Self::next`].
+    /// Make a request to some protocol by providing the ID for that protocol and request body. 
+    /// 
+    /// The required [`RequestProtocolId`] is handed back from calling [`Configuration::add_protocol()`]
+    /// with a [`RequestProtocol`].
+    /// 
+    /// This returns a [`RequestId`]. We will eventually get back exactly one [`Message::Response`] 
+    /// with this [`RequestId`] from [`Self::next`].
     pub fn request(
         &mut self,
         protocol_id: RequestProtocolId,
@@ -350,8 +355,9 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static, Platform: PlatformT> Conne
         Ok(RequestId(stream_id))
     }
 
-    /// Cancel a request. This makes a best-effort attempt to cancel an in-flight request when driven by [`Self::next`],
-    /// and will lead to a [`RequestResponse::Cancelled`] message being emitted for the given request ID.
+    /// Cancel a request. This makes a best-effort attempt to cancel an in-flight request when 
+    /// [`Self::next`] is called, and will lead to a [`RequestResponse::Cancelled`] message being 
+    /// emitted for the given request ID.
     pub fn cancel_request(&mut self, id: RequestId) {
         let Some((protocol_id, _)) = self.inflight_requests.remove(&id.0) else {
             return;
@@ -367,18 +373,20 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static, Platform: PlatformT> Conne
         });
     }
 
-    /// Respond to an incoming request.
+    /// Make a best effort to respond to an incoming request. If they close the stream (ie cancel the 
+    /// request) before we manage to send our response then the response is silently dropped.
     pub fn respond(&mut self, id: ResponseId, response: &[u8]) {
-        // If we want to handle eg the stream having been closed then we should
-        // also emit a ResponseCancelled type message. For now though we just fire
-        // and forget to respond to some request.
         let _ = self.yamux.send_data(id.0, response);
         let _ = self.yamux.close_stream(id.0);
     }
 
-    /// Begin the subscription on one of our subscription protocols. We will get back a stream
-    /// of notification messages against the provided [`SubscriptionProtocolId`] when
-    /// call [`Self::next`], until the subscription is closed, cancelled or returns an error.
+    /// Begin the subscription on one of our subscription protocols. 
+    /// 
+    /// The required [`SubscriptionProtocolId`] is handed back from calling [`Configuration::add_protocol()`]
+    /// with a [`SubscriptionProtocol`].
+    /// 
+    /// We will get back a stream of notification messages against the provided [`SubscriptionProtocolId`] 
+    /// when [`Self::next`] is called, until the subscription is closed, cancelled or returns an error.
     pub fn subscribe(
         &mut self,
         protocol_id: SubscriptionProtocolId,
@@ -407,9 +415,15 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static, Platform: PlatformT> Conne
         Ok(())
     }
 
-    /// Send a notification on a subscription. The subscription must have already been opened
-    /// (ie a [`SubscriptionResponse::Opened`] has been emitted for it, which is the result of either
-    /// calling [`Connection::subscribe()`] or the remote opening it) before we can send messages.
+    /// Send a notification on a subscription. 
+    ///
+    /// The required [`SubscriptionProtocolId`] is handed back from calling [`Configuration::add_protocol()`]
+    /// with a [`SubscriptionProtocol`].
+    ///  
+    /// The subscription must have already been opened by calling [`Connection::subscribe`] (or the remote
+    /// opening it if we allow this), and then waiting for a [`SubscriptionResponse::Opened`] event from
+    /// [`Self::next`] which indicates that it has been successfully opened. Else, we will get an error back
+    /// from calling this.
     pub fn send_notification(
         &mut self,
         protocol_id: SubscriptionProtocolId,
@@ -441,22 +455,24 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static, Platform: PlatformT> Conne
     /// Cancel a subscription. This makes a best-effort attempt to cancel an in-flight subscription when driven by [`Self::next`],
     /// and will lead to a [`SubscriptionResponse::Closed`] message being emitted for the given subscription ID.
     pub fn cancel_subscription(&mut self, id: SubscriptionProtocolId) {
-        self.cancel_subscription_silently(id);
-
-        self.next_buf.push_back(Message::Notification {
-            protocol_id: id,
-            res: SubscriptionResponse::Closed,
-        });
+        if self.cancel_subscription_silently(id) {
+            self.next_buf.push_back(Message::Notification {
+                protocol_id: id,
+                res: SubscriptionResponse::Closed,
+            });
+        }
     }
 
-    fn cancel_subscription_silently(&mut self, id: SubscriptionProtocolId) {
+    // Silently cancel a subscription (ie don't emit any messages). 
+    // Returns true if a subscription was cancelled, and false if not.
+    fn cancel_subscription_silently(&mut self, id: SubscriptionProtocolId) -> bool {
         // Find the protocol
         let Some(p) = self
             .subscription_details
             .iter_mut()
             .find(|p| p.protocol_id == id)
         else {
-            return;
+            return false;
         };
 
         // Immediately abort any open streams here to tell the peer to also
@@ -470,14 +486,15 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static, Platform: PlatformT> Conne
 
         p.our_stream = SubscriptionStreamState::Closed;
         p.their_stream = SubscriptionStreamState::Closed;
+        true
     }
 
-    /// Drive this connection, making progress and returning messages as they are received.
+    /// Drive this connection, concurrently writing and reading from our read and write streams
+    /// and returning once the next message is available on the read stream.
     /// 
     /// # Cancel safety
     /// 
-    /// This method is cancel safe. This is important, because you may with to interrupt waiting
-    /// for the next message in order to issue a command.
+    /// This method is cancel safe and the resulting future can be safely dropped.
     pub async fn next(&mut self) -> Option<Result<Message, StreamError>> {
         if self.finished {
             return None;

@@ -31,8 +31,8 @@ impl<Platform: PlatformT> Configuration<Platform> {
         }
     }
 
-    /// Add a [`RequestProtocol`] or a [`SubscriptionProtocol`], returning a unique
-    /// ID for this protocol that can be used to interact with it.
+    /// Add a [`crate::protocol::RequestProtocol`] or a [`crate::protocol::SubscriptionProtocol`], 
+    /// returning a unique ID for this protocol that can be used to interact with it.
     pub fn add_protocol<P: Protocol>(&mut self, protocol: P) -> P::Id {
         let next_id = OpaqueId::new();
         self.protocols.push((next_id, protocol.into_any_protocol()));

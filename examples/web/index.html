@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<html>
+<!-- Build:  wasm-pack build --target web   (from examples/web/)  -->
+<!-- Serve:  python3 -m http.server          (from examples/web/)  -->
+<!-- Open:   http://localhost:8000                                  -->
+<body>
+<pre id="log"></pre>
+<script type="module">
+import init from './pkg/p2p_client_web_example.js';
+await init();
+</script>
+</body>
+</html>
