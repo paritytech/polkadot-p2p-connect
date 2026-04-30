@@ -337,6 +337,7 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static> YamuxSession<R, W> {
 
     // It's easier to return Result<Option> internally, but externally we want to look like
     // a stream and return Option<Result>, hence next vs next_inner.
+    #[allow(clippy::await_holding_refcell_ref)]
     async fn next_inner(&mut self) -> Result<Option<Output>, Error> {
         self.read_write_join
             .call(
