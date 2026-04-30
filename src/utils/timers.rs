@@ -51,7 +51,7 @@ impl<T, P: PlatformT> Timers<T, P> {
     pub fn try_next(&mut self) -> Option<T> {
         // If our poll_next is false then we don't poll and return false.
         // we are waiting for our next fut to ask to be polled still.
-        if self.poll_next.load(Ordering::Relaxed) == false {
+        if !self.poll_next.load(Ordering::Relaxed) {
             return None;
         }
 

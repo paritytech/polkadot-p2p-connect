@@ -85,19 +85,19 @@ impl<T, E> ReadWriteJoin<T, E> {
                     if write_pending {
                         self.write_fut = Some(write_fut);
                     }
-                    return Poll::Pending;
+                    Poll::Pending
                 }
                 Poll::Ready(Err(e)) => {
                     if write_pending {
                         self.write_fut = Some(write_fut);
                     }
-                    return Poll::Ready(Err(e));
+                    Poll::Ready(Err(e))
                 }
                 Poll::Ready(Ok(val)) => {
                     if write_pending {
                         self.write_fut = Some(write_fut);
                     }
-                    return Poll::Ready(Ok(val));
+                    Poll::Ready(Ok(val))
                 }
             }
         })

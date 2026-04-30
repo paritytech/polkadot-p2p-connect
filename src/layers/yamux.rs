@@ -109,7 +109,7 @@ pub struct OutputData<'a> {
 }
 impl<'a> PartialEq for OutputData<'a> {
     fn eq(&self, other: &Self) -> bool {
-        self.len == other.len && &self.buf[self.len] == &other.buf[other.len]
+        self.len == other.len && self.buf[self.len] == other.buf[other.len]
     }
 }
 impl<'a> core::ops::Deref for OutputData<'a> {
@@ -141,7 +141,7 @@ impl StreamState {
     fn new() -> Self {
         StreamState {
             send_window: DEFAULT_WINDOW,
-            recv_window: DEFAULT_WINDOW as usize,
+            recv_window: DEFAULT_WINDOW,
             outbound_buf: VecDeque::new(),
             remote_fin: false,
             closed_by_us: false,
@@ -186,7 +186,7 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static> YamuxSession<R, W> {
         let stream = shared_state
             .streams
             .entry(stream_id)
-            .or_insert_with(|| StreamState::new());
+            .or_insert_with(StreamState::new);
         stream.outbound_buf.push_back(BufferedOutboundMessage::Open);
 
         stream_id
@@ -208,7 +208,7 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static> YamuxSession<R, W> {
 
         match stream.outbound_buf.back_mut() {
             Some(BufferedOutboundMessage::Data(buffered_data)) => {
-                buffered_data.extend(data.into_iter());
+                buffered_data.extend(data);
             }
             Some(BufferedOutboundMessage::Accept)
             | Some(BufferedOutboundMessage::Open)

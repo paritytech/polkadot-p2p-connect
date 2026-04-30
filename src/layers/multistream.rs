@@ -86,5 +86,5 @@ async fn read_msg(reader: &mut impl AsyncRead) -> Result<Vec<u8>, Error> {
 }
 
 fn to_string(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(&bytes).into_owned()
+    String::from_utf8_lossy(bytes).into_owned()
 }

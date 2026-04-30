@@ -26,7 +26,7 @@ impl YamuxHeader {
             version: YAMUX_VERSION,
             frame_type: FrameType::Data,
             flags: FrameFlags::empty(),
-            stream_id: stream_id,
+            stream_id,
             length: data_len,
         }
     }
@@ -37,7 +37,7 @@ impl YamuxHeader {
             version: YAMUX_VERSION,
             frame_type: FrameType::WindowUpdate,
             flags: FrameFlag::Syn.into(),
-            stream_id: stream_id,
+            stream_id,
             length: 0,
         }
     }
@@ -48,7 +48,7 @@ impl YamuxHeader {
             version: YAMUX_VERSION,
             frame_type: FrameType::WindowUpdate,
             flags: FrameFlag::Ack.into(),
-            stream_id: stream_id,
+            stream_id,
             length: 0,
         }
     }
@@ -59,7 +59,7 @@ impl YamuxHeader {
             version: YAMUX_VERSION,
             frame_type: FrameType::WindowUpdate,
             flags: FrameFlag::Rst.into(),
-            stream_id: stream_id,
+            stream_id,
             length: 0,
         }
     }
@@ -70,7 +70,7 @@ impl YamuxHeader {
             version: YAMUX_VERSION,
             frame_type: FrameType::WindowUpdate,
             flags: FrameFlag::Fin.into(),
-            stream_id: stream_id,
+            stream_id,
             length: 0,
         }
     }
@@ -81,7 +81,7 @@ impl YamuxHeader {
             version: YAMUX_VERSION,
             frame_type: FrameType::Ping,
             flags: FrameFlag::Ack.into(),
-            stream_id: stream_id,
+            stream_id,
             length: data,
         }
     }
@@ -92,7 +92,7 @@ impl YamuxHeader {
             version: YAMUX_VERSION,
             frame_type: FrameType::WindowUpdate,
             flags: FrameFlags::empty(),
-            stream_id: stream_id,
+            stream_id,
             length: delta,
         }
     }
@@ -237,10 +237,10 @@ impl FrameFlags {
         self.0 & (flag as u16) == (flag as u16)
     }
     fn iter(&self) -> impl Iterator<Item = FrameFlag> {
-        let syn = self.contains(FrameFlag::Syn).then(|| FrameFlag::Syn);
-        let ack = self.contains(FrameFlag::Ack).then(|| FrameFlag::Ack);
-        let fin = self.contains(FrameFlag::Fin).then(|| FrameFlag::Fin);
-        let rst = self.contains(FrameFlag::Rst).then(|| FrameFlag::Rst);
+        let syn = self.contains(FrameFlag::Syn).then_some(FrameFlag::Syn);
+        let ack = self.contains(FrameFlag::Ack).then_some(FrameFlag::Ack);
+        let fin = self.contains(FrameFlag::Fin).then_some(FrameFlag::Fin);
+        let rst = self.contains(FrameFlag::Rst).then_some(FrameFlag::Rst);
         syn.into_iter().chain(ack).chain(fin).chain(rst)
     }
 }

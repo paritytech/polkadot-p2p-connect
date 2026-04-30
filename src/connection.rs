@@ -365,7 +365,7 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static, Platform: PlatformT>
 
         // RST the stream here because we want to abort and for the peer to not
         // send anything back (which they are free to still do if FIN)
-        let _ = self.yamux.reset_stream_immediately(id.0);
+        self.yamux.reset_stream_immediately(id.0);
         self.next_buf.push_back(Message::Response {
             id,
             protocol_id,
@@ -377,7 +377,7 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static, Platform: PlatformT>
     /// request) before we manage to send our response then the response is silently dropped.
     pub fn respond(&mut self, id: ResponseId, response: &[u8]) {
         let _ = self.yamux.send_data(id.0, response);
-        let _ = self.yamux.close_stream(id.0);
+        self.yamux.close_stream(id.0);
     }
 
     /// Begin the subscription on one of our subscription protocols.
@@ -478,10 +478,10 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static, Platform: PlatformT>
         // Immediately abort any open streams here to tell the peer to also
         // not send any further messages on them.
         if let Some(outgoing_stream_id) = p.our_stream.stream_id() {
-            let _ = self.yamux.reset_stream_immediately(outgoing_stream_id);
+            self.yamux.reset_stream_immediately(outgoing_stream_id);
         };
         if let Some(incoming_stream_id) = p.their_stream.stream_id() {
-            let _ = self.yamux.reset_stream_immediately(incoming_stream_id);
+            self.yamux.reset_stream_immediately(incoming_stream_id);
         };
 
         p.our_stream = SubscriptionStreamState::Closed;
