@@ -29,6 +29,7 @@ const MAX_STREAMS: usize = 256;
 const MAX_FRAME_SIZE: usize = 512 * 1024; // 512kb
 
 #[derive(Debug, thiserror::Error)]
+#[allow(clippy::enum_variant_names)]
 pub enum Error {
     #[error("stream error receiving bytes: {0}")]
     AsyncRead(#[from] AsyncReadError),
@@ -606,93 +607,95 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static> YamuxSession<R, W> {
         let mut bytes_to_write = Vec::new();
         let mut streams_to_remove = Vec::new();
 
-        let mut shared_state = shared_state.borrow_mut();
-        let streams = &mut shared_state.streams;
+        // Ensure shared_state is dropped before any await point.
+        {
+            let mut shared_state = shared_state.borrow_mut();
+            let streams = &mut shared_state.streams;
 
-        for (&stream_id, stream) in streams.iter_mut() {
-            let Some(msg) = stream.outbound_buf.pop_front() else {
-                continue;
-            };
+            for (&stream_id, stream) in streams.iter_mut() {
+                let Some(msg) = stream.outbound_buf.pop_front() else {
+                    continue;
+                };
 
-            match msg {
-                BufferedOutboundMessage::Accept => {
-                    tracing::debug!(target: LOG_TARGET, "accepting stream {stream_id}");
-                    bytes_to_write.extend(YamuxHeader::accept_stream(stream_id).encode());
-                }
-                BufferedOutboundMessage::Open => {
-                    tracing::debug!(target: LOG_TARGET, "opening stream {stream_id}");
-                    bytes_to_write.extend(YamuxHeader::open_stream(stream_id).encode());
-                }
-                BufferedOutboundMessage::Close => {
-                    tracing::debug!(target: LOG_TARGET, "closing stream {stream_id} (FIN)");
-                    bytes_to_write.extend(YamuxHeader::close_stream(stream_id).encode());
-
-                    // Note: In theory we are sending FIN here which allows the other side
-                    // to continue sending data, but in practice we are happy to close it
-                    // entirely because at a higher level, we ignore any messages given back
-                    // on a closed stream since the protocol has ended successfully.
-                    streams_to_remove.push(stream_id);
-                }
-                BufferedOutboundMessage::Reset => {
-                    tracing::debug!(target: LOG_TARGET, "closing stream {stream_id} (RST)");
-                    bytes_to_write.extend(YamuxHeader::reset_stream(stream_id).encode());
-                    streams_to_remove.push(stream_id);
-                }
-                BufferedOutboundMessage::WindowUpdate(len) => {
-                    tracing::debug!(target: LOG_TARGET, "window update for stream {stream_id} ({len} bytes)");
-                    bytes_to_write.extend(YamuxHeader::window_update(stream_id, len).encode());
-                }
-                BufferedOutboundMessage::Data(mut outbound_data) => {
-                    let bytes_to_send = usize::min(stream.send_window, outbound_data.len());
-                    tracing::debug!(target: LOG_TARGET, "sending {bytes_to_send} DATA bytes on stream {stream_id}");
-
-                    // If we can't send anything on this stream, put the message back on the queue and break
-                    // to stop pulling items from this streams queue. We need a window update before we can
-                    // send more data on this stream.
-                    if bytes_to_send == 0 {
-                        stream
-                            .outbound_buf
-                            .push_back(BufferedOutboundMessage::Data(outbound_data));
-                        continue;
+                match msg {
+                    BufferedOutboundMessage::Accept => {
+                        tracing::debug!(target: LOG_TARGET, "accepting stream {stream_id}");
+                        bytes_to_write.extend(YamuxHeader::accept_stream(stream_id).encode());
                     }
+                    BufferedOutboundMessage::Open => {
+                        tracing::debug!(target: LOG_TARGET, "opening stream {stream_id}");
+                        bytes_to_write.extend(YamuxHeader::open_stream(stream_id).encode());
+                    }
+                    BufferedOutboundMessage::Close => {
+                        tracing::debug!(target: LOG_TARGET, "closing stream {stream_id} (FIN)");
+                        bytes_to_write.extend(YamuxHeader::close_stream(stream_id).encode());
 
-                    // VecDeque is two slices internally, so we work out how many bytes of
-                    // each slice we need to send to satisfy the above.
-                    let (a, b) = outbound_data.as_slices();
-                    let a_len = usize::min(bytes_to_send, a.len());
-                    let b_len = bytes_to_send.saturating_sub(a.len());
+                        // Note: In theory we are sending FIN here which allows the other side
+                        // to continue sending data, but in practice we are happy to close it
+                        // entirely because at a higher level, we ignore any messages given back
+                        // on a closed stream since the protocol has ended successfully.
+                        streams_to_remove.push(stream_id);
+                    }
+                    BufferedOutboundMessage::Reset => {
+                        tracing::debug!(target: LOG_TARGET, "closing stream {stream_id} (RST)");
+                        bytes_to_write.extend(YamuxHeader::reset_stream(stream_id).encode());
+                        streams_to_remove.push(stream_id);
+                    }
+                    BufferedOutboundMessage::WindowUpdate(len) => {
+                        tracing::debug!(target: LOG_TARGET, "window update for stream {stream_id} ({len} bytes)");
+                        bytes_to_write.extend(YamuxHeader::window_update(stream_id, len).encode());
+                    }
+                    BufferedOutboundMessage::Data(mut outbound_data) => {
+                        let bytes_to_send = usize::min(stream.send_window, outbound_data.len());
+                        tracing::debug!(target: LOG_TARGET, "sending {bytes_to_send} DATA bytes on stream {stream_id}");
 
-                    // Send the appropriate header and then the corresponding bytes. Because
-                    // we have two slices above, we break this into two sends if necessary.
-                    bytes_to_write.extend(YamuxHeader::send_data(stream_id, a_len as u32).encode());
-                    bytes_to_write.extend(&a[..a_len]);
-                    if b_len > 0 {
+                        // If we can't send anything on this stream, put the message back on the queue and break
+                        // to stop pulling items from this streams queue. We need a window update before we can
+                        // send more data on this stream.
+                        if bytes_to_send == 0 {
+                            stream
+                                .outbound_buf
+                                .push_back(BufferedOutboundMessage::Data(outbound_data));
+                            continue;
+                        }
+
+                        // VecDeque is two slices internally, so we work out how many bytes of
+                        // each slice we need to send to satisfy the above.
+                        let (a, b) = outbound_data.as_slices();
+                        let a_len = usize::min(bytes_to_send, a.len());
+                        let b_len = bytes_to_send.saturating_sub(a.len());
+
+                        // Send the appropriate header and then the corresponding bytes. Because
+                        // we have two slices above, we break this into two sends if necessary.
                         bytes_to_write
-                            .extend(YamuxHeader::send_data(stream_id, b_len as u32).encode());
-                        bytes_to_write.extend(&b[..b_len]);
-                    }
+                            .extend(YamuxHeader::send_data(stream_id, a_len as u32).encode());
+                        bytes_to_write.extend(&a[..a_len]);
+                        if b_len > 0 {
+                            bytes_to_write
+                                .extend(YamuxHeader::send_data(stream_id, b_len as u32).encode());
+                            bytes_to_write.extend(&b[..b_len]);
+                        }
 
-                    // Decrement the send window. When this runs out we'll be forced to
-                    // wait for a window update from them before we can send more.
-                    stream.send_window = stream.send_window.saturating_sub(bytes_to_send);
+                        // Decrement the send window. When this runs out we'll be forced to
+                        // wait for a window update from them before we can send more.
+                        stream.send_window = stream.send_window.saturating_sub(bytes_to_send);
 
-                    // If we didn't send all of the bytes, then drain what we did send and put
-                    // the message back onto the queue to be tried again later.
-                    if bytes_to_send != outbound_data.len() {
-                        outbound_data.drain(..bytes_to_send);
-                        stream
-                            .outbound_buf
-                            .push_back(BufferedOutboundMessage::Data(outbound_data));
+                        // If we didn't send all of the bytes, then drain what we did send and put
+                        // the message back onto the queue to be tried again later.
+                        if bytes_to_send != outbound_data.len() {
+                            outbound_data.drain(..bytes_to_send);
+                            stream
+                                .outbound_buf
+                                .push_back(BufferedOutboundMessage::Data(outbound_data));
+                        }
                     }
                 }
             }
-        }
 
-        for stream_id in streams_to_remove {
-            streams.remove(&stream_id);
+            for stream_id in streams_to_remove {
+                streams.remove(&stream_id);
+            }
         }
-
-        drop(shared_state);
 
         // Perform a single write at the end with everything, to:
         // a) avoid holding onto our shared state across an await point,

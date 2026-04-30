@@ -495,8 +495,6 @@ fn bytes_equal_iter(value: &[u8], iter: impl ExactSizeIterator<Item = u8>) -> bo
 
 #[cfg(test)]
 mod test {
-    use core::usize;
-
     use super::*;
     use crate::layers::yamux::header::{FrameType, YamuxHeader};
     use crate::utils::testing::{MockStream, MockStreamHandle, block_on};
@@ -514,7 +512,7 @@ mod test {
     }
 
     /// Send some multistream frames (which will be prefixed with their varint length) in a yamux data frame.
-    fn send_data<'a>(handle: &mut MockStreamHandle, n: u32, messages: &[&[u8]]) {
+    fn send_data(handle: &mut MockStreamHandle, n: u32, messages: &[&[u8]]) {
         // First encode our messages so that we know the yamux frame length
         let mut data = Vec::new();
         for msg in messages {
@@ -738,9 +736,7 @@ mod test {
         let mut data = vec![];
         let ten_mb = 10 * 1024 * 1024;
         varint::encode_to_vec(ten_mb, &mut data);
-        for _ in 0..ten_mb {
-            data.push(123u8);
-        }
+        data.extend(core::iter::repeat_n(123u8, ten_mb as usize));
 
         // Now, chunk and send this as many yamux frames
         for bytes in data.chunks(10 * 1024) {

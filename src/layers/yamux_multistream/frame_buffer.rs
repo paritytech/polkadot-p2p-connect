@@ -61,9 +61,7 @@ impl MultistreamFrameBuffer {
                 // We're still decoding the length bytes. Try and decode another
                 // byte from the input.
                 MultistreamFrameBufferNeeds::DecodingLen(decoder) => {
-                    let Some(byte) = self.buf.pop_front() else {
-                        return None;
-                    };
+                    let byte = self.buf.pop_front()?;
                     match decoder.feed(byte) {
                         varint::DecoderOutput::Value(len) => {
                             self.needs = MultistreamFrameBufferNeeds::Len(len as usize);

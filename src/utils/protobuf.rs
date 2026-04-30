@@ -71,7 +71,7 @@ pub fn decode<'input, V: Visitor<'input>>(
     while !cursor.is_empty() {
         let tag_val = varint::decode(cursor)?;
         // everything but the smallest 3 bits are the field number
-        let field_number = (tag_val >> 3);
+        let field_number = tag_val >> 3;
         // the smallest 3 bits denote the typw of the field
         let wire_type = WireType::from((tag_val & 0x07) as u8);
 

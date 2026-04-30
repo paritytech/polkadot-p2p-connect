@@ -106,7 +106,7 @@ async fn main() -> anyhow::Result<()> {
                         _ => "unknown",
                     };
                     // The rest is the header.
-                    let block_hash = hex::encode(&block_hash(&data));
+                    let block_hash = hex::encode(block_hash(&data));
                     println!("hash={block_hash} type={block_type}");
                 }
                 SubscriptionResponse::Closed => {
@@ -129,5 +129,5 @@ async fn main() -> anyhow::Result<()> {
 fn block_hash(header: &[u8]) -> [u8; 32] {
     use blake2::digest::consts::U32;
     use blake2::{Blake2b, Digest as _};
-    Blake2b::<U32>::digest(&header).into()
+    Blake2b::<U32>::digest(header).into()
 }

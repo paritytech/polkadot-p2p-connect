@@ -8,6 +8,7 @@ use core::task::Poll;
 ///
 /// This is used specifically when calling YamuxSession::next and is
 /// somewhat tailored to that use case.
+#[allow(clippy::type_complexity)]
 pub struct ReadWriteJoin<T, E> {
     write_fut: Option<Pin<Box<dyn Future<Output = Result<(), E>>>>>,
     read_fut: Option<Pin<Box<dyn Future<Output = Result<T, E>>>>>,

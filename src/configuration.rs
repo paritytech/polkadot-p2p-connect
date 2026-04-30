@@ -19,9 +19,8 @@ pub struct Configuration<Platform> {
     pub(crate) protocols: Vec<(OpaqueId, AnyProtocol)>,
 }
 
-impl<Platform: PlatformT> Configuration<Platform> {
-    /// Create some new connection configuration.
-    pub fn new() -> Self {
+impl<Platform> Default for Configuration<Platform> {
+    fn default() -> Self {
         Self {
             identity_secret: None,
             noise_timeout: Duration::from_secs(30),
@@ -29,6 +28,13 @@ impl<Platform: PlatformT> Configuration<Platform> {
             marker: PhantomData,
             protocols: Default::default(),
         }
+    }
+}
+
+impl<Platform: PlatformT> Configuration<Platform> {
+    /// Create some new connection configuration.
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Add a [`crate::protocol::RequestProtocol`] or a [`crate::protocol::SubscriptionProtocol`],

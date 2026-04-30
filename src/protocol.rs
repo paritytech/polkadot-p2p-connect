@@ -4,7 +4,6 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::time::Duration;
-use core::usize;
 
 /// This is implemented for [`RequestProtocol`] and [`SubscriptionProtocol`], to
 /// allow them to be used in [`crate::Configuration::add_protocol`]. It cannot be implemented by

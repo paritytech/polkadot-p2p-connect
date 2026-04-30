@@ -516,7 +516,7 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static, Platform: PlatformT>
     async fn next_inner(&mut self) -> Result<Option<Message>, StreamError> {
         loop {
             // Drain any local messages we need to emit first
-            while let Some(message) = self.next_buf.pop_front() {
+            if let Some(message) = self.next_buf.pop_front() {
                 return Ok(Some(message));
             }
 

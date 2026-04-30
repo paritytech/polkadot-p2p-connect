@@ -124,7 +124,7 @@ mod test {
     }
 
     std::thread_local! {
-        static MOCK_SLEEPS: RefCell<Vec<Arc<MockSleepInner>>> = RefCell::new(Vec::new());
+        static MOCK_SLEEPS: RefCell<Vec<Arc<MockSleepInner>>> = const { RefCell::new(Vec::new()) };
     }
 
     /// This test platform only impls sleep and hands back our [`MockSleep`] type,
