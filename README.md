@@ -149,6 +149,12 @@ Given some way to read and write bytes to a stream (denoted by the `AsyncRead` a
 
 # FAQ
 
+## Why do I have to provide implementations for things like `PlatformT`, `AsyncRead` and `AsyncWrite`?
+
+This library is no-std (+alloc) (which is why `cargo check --target thumbv7em-none-eabi` will work in it). This means that it does not natively have access to things like randomness (which is required for the noise encryption for example), and has no way to time things. The `PlatformT` trait allows the user to provide this necessary funcionality for whichever platform they want to run this library in.
+
+Being no-std also means no networking facilities, so once again the user must bring their own networking and implement `AsyncRead` and `AsyncWrite` for whichever stream of data they wish to connect to a peer on. This also makes it easy to test many parts of the codebase, and allows implementations to target pure TCP connections, or WebSocket connections (inside a browser or natively) easy to do. 
+
 ## Why do I have to define the protocols that I'll use up front?
 
 When we connect to a peer, we are both a client _and_ a server. On the one hand, we can request data from the peer and open subscriptions to it, but on the other hand they can also do the same with us.
@@ -165,3 +171,24 @@ This library opts for (1) in order to avoid needing to buffer a potentially unbo
 
 The trick here is that `.next()` is cancel-safe, allowing the future that it returns to be dropped at any point. This allows it to be used in conjunction with things like `tokio::select!` to interrupt it if, for instance, some new command comes in on another channel, and safely resume it after reacting to said command.
 
+An as example; this sort of thing will work fine:
+
+```rust
+let mut i = tokio::time::interval(core::time::Duration::from_millis(100))
+loop {
+    tokio::select! {
+        message = conn.next() => {
+            // Handle next message
+        },
+        interval = i.tick() => {
+            // Do something else.
+        }
+    };
+}
+```
+
+## How is it that most methods are _not_ async? wouldn't opening subscriptions and sending requests require async?
+
+All reads and writes are handled concurrently inside the async `.next()` method; every other method simply queues up messages to be sent as needed when `.next()` is called again. One reason for this is that it makes it very easy for all reads and writes to happen concurrently, as opposed to the user having to interrupt `.next()` to call some other async function which blocks reading until it has finished writing. Another reason is that it makes it easy to progress multiple `Connection`s concurrently, ie inside a `tokio::select!` or something like a `FuturesUnordered`, or in separate threads.
+
+One thing to be careful of is that there is no limit to how many writes can be queued up by the user. I don't think that this should normally be a big issue since the library is intended to be very read heavy (ie its primary target is to be used in light clients which are mostly consuming data).
