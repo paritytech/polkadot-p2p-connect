@@ -99,12 +99,13 @@ async fn main() -> anyhow::Result<()> {
         ("polkadot-bootnode-0.polkadot.io", 30333),
         ("boot-node.helikon.io", 7070),
     ];
-    let bootnode_n = 0;
+    let mut bootnode_n = 0;
 
     // loop this bit in case we get rate limited and need to retry the connection.
     loop {
         // Round robin between bootnodes to try and avoid rate limits etc.
         let bootnode_addr = bootnodes[bootnode_n % bootnodes.len()];
+        bootnode_n += 1;
 
         // Connect to a Polkadot bootnode via TCP.
         let tcp = TcpStream::connect(bootnode_addr).await?;
