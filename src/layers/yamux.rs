@@ -337,6 +337,11 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static> YamuxSession<R, W> {
 
     // It's easier to return Result<Option> internally, but externally we want to look like
     // a stream and return Option<Result>, hence next vs next_inner.
+    //
+    // Reader/Writer things are Rc<RefCell<..>> because we need to hand ownership of them 
+    // into the future, such that if the future is dropped then YamuxSession still owns them too.
+    // Only one future will ever use each and so it's ok if they pass over await points.
+    // shared_state on the other hand is used in both futures and must NOT pass await points.
     #[allow(clippy::await_holding_refcell_ref)]
     async fn next_inner(&mut self) -> Result<Option<Output>, Error> {
         self.read_write_join

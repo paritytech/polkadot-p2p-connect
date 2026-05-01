@@ -1,6 +1,6 @@
 //! This crate is used to establish a peer-to-peer connection with a node on the Polkadot network.
 //!
-//! For an easy start, look at the examples in the repositories `/examples` folder.
+//! For an easy start, look at the examples in the repository `/examples` folder.
 //!
 //! Essentially, the steps are:
 //!
