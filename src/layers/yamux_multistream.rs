@@ -76,6 +76,7 @@ enum MultistreamState {
         rest: VecDeque<String>,
     },
     Open,
+    ClosedByUs,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -199,13 +200,19 @@ impl<R: async_stream::AsyncRead + 'static, W: async_stream::AsyncWrite + 'static
 
     /// Close a stream.
     pub fn close_stream(&mut self, stream_id: YamuxStreamId) {
-        self.bufs.remove(&stream_id);
+        let Some(stream) = self.bufs.get_mut(&stream_id) else {
+            return;
+        };
+        stream.state = MultistreamState::ClosedByUs;
         self.inner.close_stream(stream_id);
     }
 
     /// Close a stream immediately, unbuffering any messages buffered to send prior to this call.
     pub fn close_stream_immediately(&mut self, stream_id: YamuxStreamId) {
-        self.bufs.remove(&stream_id);
+        let Some(stream) = self.bufs.get_mut(&stream_id) else {
+            return;
+        };
+        stream.state = MultistreamState::ClosedByUs;
         self.inner.close_stream_immediately(stream_id);
     }
 
@@ -420,7 +427,7 @@ impl<R: async_stream::AsyncRead + 'static, W: async_stream::AsyncWrite + 'static
                     }
                 }
                 // Emit any data received from a stream once multistream negotiations are complete.
-                MultistreamState::Open => {
+                MultistreamState::Open | MultistreamState::ClosedByUs => {
                     let data: Vec<u8> = byte_iter.collect();
                     return Ok(Some(Output {
                         stream_id,
@@ -442,8 +449,7 @@ impl<R: async_stream::AsyncRead + 'static, W: async_stream::AsyncWrite + 'static
         let mut data_len = [0u8; 10];
         let varint_len = varint::encode(data.len() as u64, &mut data_len);
 
-        self.inner
-            .send_data(stream_id, &data_len[..varint_len])?;
+        self.inner.send_data(stream_id, &data_len[..varint_len])?;
         self.inner.send_data(stream_id, data)?;
         Ok(())
     }
@@ -459,8 +465,7 @@ impl<R: async_stream::AsyncRead + 'static, W: async_stream::AsyncWrite + 'static
         // Add 1 for the newline we'll append.
         let varint_len = varint::encode(data.len() as u64 + 1, &mut data_len);
 
-        self.inner
-            .send_data(stream_id, &data_len[..varint_len])?;
+        self.inner.send_data(stream_id, &data_len[..varint_len])?;
         self.inner.send_data(stream_id, data)?;
         self.inner.send_data(stream_id, b"\n".as_slice())?;
         Ok(())
@@ -785,9 +790,13 @@ mod test {
         // Take yamux data frames from the output, appending them together
         // and driving the stream as needed to absorb new window updates to
         // allow progress to continue.
+        // The multistream layer prefixes data with a varint length, so we
+        // need to collect varint_len + ten_mb bytes total.
+        let mut varint_buf = [0u8; 10];
+        let varint_len = varint::encode(ten_mb as u64, &mut varint_buf);
         let mut response = vec![];
         let mut frame_count = 0usize;
-        while response.len() < ten_mb {
+        while response.len() < ten_mb + varint_len {
             let header = next_yamux_header(&mut handle);
 
             assert_eq!(

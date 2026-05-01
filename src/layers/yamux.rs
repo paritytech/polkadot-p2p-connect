@@ -127,9 +127,31 @@ impl<'a> core::ops::Deref for OutputData<'a> {
 struct StreamState {
     send_window: usize,
     recv_window: usize,
-    remote_fin: bool,
-    closed_by_us: bool,
+    open_state: OpenState,
     outbound_buf: VecDeque<BufferedOutboundMessage>,
+}
+
+#[derive(Copy, Clone, Debug)]
+enum OpenState {
+    Open,
+    FinByUs,
+    FinByThem,
+    Reset,
+}
+
+impl OpenState {
+    fn set_fin_by_them(self) -> Self {
+        match self {
+            OpenState::Open | OpenState::FinByThem => OpenState::FinByThem,
+            OpenState::Reset | OpenState::FinByUs => OpenState::Reset,
+        }
+    }
+    fn set_fin_by_us(self) -> Self {
+        match self {
+            OpenState::Open | OpenState::FinByUs => OpenState::FinByUs,
+            OpenState::Reset | OpenState::FinByThem => OpenState::Reset,
+        }
+    }
 }
 
 enum BufferedOutboundMessage {
@@ -147,8 +169,7 @@ impl StreamState {
             send_window: DEFAULT_WINDOW,
             recv_window: DEFAULT_WINDOW,
             outbound_buf: VecDeque::new(),
-            remote_fin: false,
-            closed_by_us: false,
+            open_state: OpenState::Open,
         }
     }
 }
@@ -199,11 +220,7 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static> YamuxSession<R, W> {
     /// Schedule some bytes to be sent on a given stream. Run [`Self::next()`] to
     /// progress this. This respects the window size and may be slow to send if the
     /// receiver is slow or keeps the window size small on some stream.
-    pub fn send_data(
-        &mut self,
-        stream_id: YamuxStreamId,
-        data: &[u8],
-    ) -> Result<(), Error> {
+    pub fn send_data(&mut self, stream_id: YamuxStreamId, data: &[u8]) -> Result<(), Error> {
         let mut shared_state = self.shared_state.borrow_mut();
 
         let Some(stream) = shared_state.streams.get_mut(&stream_id) else {
@@ -233,8 +250,8 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static> YamuxSession<R, W> {
     }
 
     /// Schedule the stream to be closed. This waits for any other scheduled data to be
-    /// sent before initiating the close. Run [`Self::next()`] to progress this. Until the
-    /// close has been enacted, data on this stream may still be emitted.
+    /// sent before initiating the close. Run [`Self::next()`] to progress this. We can still
+    /// be sent data because we have only closed our side.
     pub fn close_stream(&mut self, stream_id: YamuxStreamId) {
         let mut shared_state = self.shared_state.borrow_mut();
 
@@ -253,8 +270,8 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static> YamuxSession<R, W> {
     }
 
     /// Schedule the stream to be closed immediately. This ignores any data scheduled to be sent
-    /// and will close the stream as soon as [`Self::next()`] is called. No further data will
-    /// be seen for this stream.
+    /// and will close the stream as soon as [`Self::next()`] is called. We can still be sent data
+    /// because we have only closed our side.
     pub fn close_stream_immediately(&mut self, stream_id: YamuxStreamId) {
         let mut shared_state = self.shared_state.borrow_mut();
 
@@ -263,11 +280,11 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static> YamuxSession<R, W> {
             return;
         };
 
+        stream.open_state = stream.open_state.set_fin_by_us();
         stream.outbound_buf.clear();
         stream
             .outbound_buf
             .push_back(BufferedOutboundMessage::Close);
-        stream.closed_by_us = true;
     }
 
     /// Schedule the stream to be closed immediately via the more aggressive RST flag. This ignores any
@@ -303,7 +320,9 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static> YamuxSession<R, W> {
         stream
             .outbound_buf
             .push_back(BufferedOutboundMessage::Reset);
-        stream.closed_by_us = true;
+
+        // Mark both sides as reset, so we ignore anything.
+        stream.open_state = OpenState::Reset;
     }
 
     /// Drive our session, returning the next chunk of bytes on any given stream.
@@ -343,7 +362,7 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static> YamuxSession<R, W> {
     // It's easier to return Result<Option> internally, but externally we want to look like
     // a stream and return Option<Result>, hence next vs next_inner.
     //
-    // Reader/Writer things are Rc<RefCell<..>> because we need to hand ownership of them 
+    // Reader/Writer things are Rc<RefCell<..>> because we need to hand ownership of them
     // into the future, such that if the future is dropped then YamuxSession still owns them too.
     // Only one future will ever use each and so it's ok if they pass over await points.
     // shared_state on the other hand is used in both futures and must NOT pass await points.
@@ -429,11 +448,19 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static> YamuxSession<R, W> {
 
                     // If they sent Fin then error. If we closed then we'll remove later, but ignore
                     // anything else immediately.
-                    if stream.remote_fin {
-                        return Err(Error::DataSentAfterFin(stream_id));
-                    }
-                    if stream.closed_by_us {
-                        continue;
+                    match stream.open_state {
+                        OpenState::FinByThem => {
+                            // They sent fin so they shouldn't then send data.
+                            return Err(Error::DataSentAfterFin(stream_id));
+                        }
+                        OpenState::Reset => {
+                            // RST but we still know about stream so it hasn't kicked in yet.
+                            // just ignore any data on the stream.
+                            continue;
+                        }
+                        OpenState::FinByUs | OpenState::Open => {
+                            // All good; we can still receive data.
+                        }
                     }
 
                     // Decrement the receive window given the data. We don't care if they send more data
@@ -452,7 +479,7 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static> YamuxSession<R, W> {
                     } else if flags.contains(FrameFlag::Fin) {
                         // If the stream is FIN then we mark that the remote won't send more.
                         // Deliver the data first, then ClosedByRemote on the next call.
-                        stream.remote_fin = true;
+                        stream.open_state = OpenState::FinByThem;
                         shared_state.output_buf = Some(Output {
                             stream_id,
                             state: OutputState::ClosedByRemote,
@@ -513,8 +540,8 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static> YamuxSession<R, W> {
                         continue;
                     };
 
-                    // Ignore/don't emit any messages if we closed the stream already.
-                    if stream.closed_by_us {
+                    // Ignore/don't emit any messages if stream is fully closed already.
+                    if matches!(stream.open_state, OpenState::Reset) {
                         continue;
                     }
 
@@ -533,7 +560,7 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static> YamuxSession<R, W> {
                         // If FIN was sent then they won't send more so we acknowledge,
                         // but we'll still accept window updates and can send to them.
                         // If the stream is SYN then it's just been opened; tell the user this.
-                        stream.remote_fin = true;
+                        stream.open_state = stream.open_state.set_fin_by_them();
                         return Ok(Some(Output {
                             stream_id,
                             state: OutputState::ClosedByRemote,
@@ -641,11 +668,10 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static> YamuxSession<R, W> {
                         tracing::debug!(target: LOG_TARGET, "closing stream {stream_id} (FIN)");
                         bytes_to_write.extend(YamuxHeader::close_stream(stream_id).encode());
 
-                        // Note: In theory we are sending FIN here which allows the other side
-                        // to continue sending data, but in practice we are happy to close it
-                        // entirely because at a higher level, we ignore any messages given back
-                        // on a closed stream since the protocol has ended successfully.
-                        streams_to_remove.push(stream_id);
+                        // Note: we are sending FIN to the other side to close our half, but
+                        // don't want to entirely close the stream because we may still be waiting to
+                        // receive some data back. So, ensure the open_state is correct now but don't remove.
+                        stream.open_state = stream.open_state.set_fin_by_us();
                     }
                     BufferedOutboundMessage::Reset => {
                         tracing::debug!(target: LOG_TARGET, "closing stream {stream_id} (RST)");
@@ -658,7 +684,10 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static> YamuxSession<R, W> {
                     }
                     BufferedOutboundMessage::Data(mut outbound_data) => {
                         // Ensure that the bytes we send are capped by the send window size and MAX_SEND_SIZE.
-                        let bytes_to_send = outbound_data.len().min(stream.send_window).min(MAX_SEND_SIZE);
+                        let bytes_to_send = outbound_data
+                            .len()
+                            .min(stream.send_window)
+                            .min(MAX_SEND_SIZE);
                         tracing::debug!(target: LOG_TARGET, "sending {bytes_to_send} DATA bytes on stream {stream_id}");
 
                         // If we can't send anything on this stream, put the message back on the queue and break
