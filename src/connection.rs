@@ -584,7 +584,7 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static, Platform: PlatformT>
                             // We got a response back! Give it to the user.
                             OutputState::Data(bytes) => {
                                 self.inflight_requests.remove(&stream_id);
-                                self.yamux.close_stream_immediately(stream_id);
+                                self.yamux.reset_stream_immediately(stream_id);
                                 return Ok(Some(Message::Response {
                                     id: RequestId(stream_id),
                                     protocol_id,
@@ -598,8 +598,17 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static, Platform: PlatformT>
                             OutputState::Closed(reason) => {
                                 self.inflight_requests.remove(&stream_id);
                                 let error = match reason {
-                                    CloseReason::ClosedByRemote => RequestResponseError::ClosedByRemote,
-                                    CloseReason::IncomingMessageTooLarge => RequestResponseError::RemotePayloadTooLarge,
+                                    CloseReason::ClosedByRemote => {
+                                        // They closed it and we removed it; make sure to
+                                        // tell the yamux layer it can remove it too now.
+                                        self.yamux.reset_stream_immediately(stream_id);
+                                        RequestResponseError::ClosedByRemote
+                                    },
+                                    CloseReason::IncomingMessageTooLarge => {
+                                        // In this case Yamux will have closed the stream 
+                                        // anyway since it errored.
+                                        RequestResponseError::RemotePayloadTooLarge
+                                    },
                                 };
                                 return Ok(Some(Message::Response {
                                     id: RequestId(stream_id),

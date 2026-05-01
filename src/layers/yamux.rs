@@ -272,6 +272,8 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static> YamuxSession<R, W> {
     /// Schedule the stream to be closed immediately. This ignores any data scheduled to be sent
     /// and will close the stream as soon as [`Self::next()`] is called. We can still be sent data
     /// because we have only closed our side.
+    // Not used right now but kept here in case we decide to use it somewhere.
+    #[allow(dead_code)]
     pub fn close_stream_immediately(&mut self, stream_id: YamuxStreamId) {
         let mut shared_state = self.shared_state.borrow_mut();
 

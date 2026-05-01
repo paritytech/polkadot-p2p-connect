@@ -293,6 +293,7 @@ impl<R: async_stream::AsyncRead + 'static, W: async_stream::AsyncWrite + 'static
                     }
                     yamux::OutputState::ClosedByRemote => {
                         tracing::debug!(target: LOG_TARGET, "stream {stream_id} closed by remote");
+
                         // Only emit a `Closed` message if this stream progressed far enough to
                         // actually emit some other message (eg OutputState::IncomingProtocol). If it
                         // didn't get this far then nothing knows about it yet anyway.
@@ -417,7 +418,7 @@ impl<R: async_stream::AsyncRead + 'static, W: async_stream::AsyncWrite + 'static
                                 )?;
                             } else {
                                 tracing::debug!(target: LOG_TARGET, "protocol {current} rejected by remote, request to close stream {stream_id}");
-                                self.close_stream_immediately(stream_id);
+                                self.reset_stream_immediately(stream_id);
                                 return Ok(Some(Output {
                                     stream_id,
                                     state: OutputState::OutgoingRejected,

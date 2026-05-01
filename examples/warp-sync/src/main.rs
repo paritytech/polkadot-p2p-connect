@@ -83,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
     // Warp sync request-response protocol.
     let warp_sync_id = config.add_protocol(
         RequestProtocol::new(format!("/{genesis_hex}/sync/warp"))
-            .with_max_response_size(16 * 1024 * 1024) // 16 MB
+            .with_max_response_size(32 * 1024 * 1024) // 32 MB
             .with_timeout(Duration::from_secs(60)),
     );
 
@@ -171,9 +171,10 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Message::Response {
                     protocol_id,
-                    res: RequestResponse::Error(_e),
+                    res: RequestResponse::Error(e),
                     ..
                 } if protocol_id == warp_sync_id => {
+                    eprintln!("Error requesting warp sync data (will retry after 30s): {e}");
                     // Break the while loop to retry.
                     break
                 }
@@ -184,7 +185,6 @@ async fn main() -> anyhow::Result<()> {
         }
 
         // If we get here we'll retry with a new connection.
-        eprintln!("Connection closed or error before warp sync completed; retrying after delay (probably rate limited)");
         tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
     }
 }
