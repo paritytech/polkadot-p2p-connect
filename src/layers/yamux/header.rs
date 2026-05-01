@@ -133,9 +133,9 @@ impl YamuxHeader {
 /// An error decoding yamux headers.
 #[derive(thiserror::Error, Debug)]
 pub enum YamuxHeaderDecodeError {
-    #[error("invalud yamux version; expected 0 but got {0}")]
+    #[error("invalid yamux version; expected 0 but got {0}")]
     InvalidVersion(u8),
-    #[error("invalud yamux frame type; got {0}")]
+    #[error("invalid yamux frame type; got {0}")]
     InvalidFrameType(u8),
 }
 

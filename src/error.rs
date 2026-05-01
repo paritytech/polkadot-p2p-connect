@@ -52,7 +52,7 @@ enum ProtocolErrorKind {
     YamuxMultistream(yamux_multistream::Error),
 }
 
-// Impls to make converitng between internal errors and our opaque ProtocolError variants easy:
+// Impls to make converting between internal errors and our opaque ProtocolError variants easy:
 
 impl From<multistream::Error> for ConnectionError {
     fn from(value: multistream::Error) -> Self {

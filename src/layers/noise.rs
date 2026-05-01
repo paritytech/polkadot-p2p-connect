@@ -24,7 +24,7 @@ pub enum Error {
     #[error("error decoding noise handshake from protobuf: {0}")]
     NoiseHandshakeFromProtobufError(#[from] NoiseHandshakeFromProtobufError),
     #[error("noise remote static key expected but unavailable")]
-    RemoveStaticKeyNotAvailable,
+    RemoteStaticKeyNotAvailable,
     #[error("remote peer ID {got} is not the expected peer ID of {expected}")]
     RemotePeerIdMismatch {
         /// The Peer ID that we expected.
@@ -81,7 +81,7 @@ pub async fn handshake_dialer<R: AsyncRead, W: AsyncWrite, P: PlatformT>(
     // Verify the remote peer's identity.
     let remote_static = noise
         .get_remote_static()
-        .ok_or_else(|| Error::RemoveStaticKeyNotAvailable)?;
+        .ok_or_else(|| Error::RemoteStaticKeyNotAvailable)?;
     let signed_msg: Vec<u8> = [STATIC_KEY_DOMAIN, remote_static].concat();
     if !verify_ed25519(&noise_payload.key, &signed_msg, &noise_payload.signature) {
         return Err(Error::InvalidIdentitySignatureFromRemote);

@@ -443,8 +443,8 @@ impl<R: async_stream::AsyncRead + 'static, W: async_stream::AsyncWrite + 'static
         let varint_len = varint::encode(data.len() as u64, &mut data_len);
 
         self.inner
-            .send_data(stream_id, data_len[..varint_len].iter().copied())?;
-        self.inner.send_data(stream_id, data.iter().copied())?;
+            .send_data(stream_id, &data_len[..varint_len])?;
+        self.inner.send_data(stream_id, data)?;
         Ok(())
     }
 
@@ -460,9 +460,9 @@ impl<R: async_stream::AsyncRead + 'static, W: async_stream::AsyncWrite + 'static
         let varint_len = varint::encode(data.len() as u64 + 1, &mut data_len);
 
         self.inner
-            .send_data(stream_id, data_len[..varint_len].iter().copied())?;
-        self.inner.send_data(stream_id, data.iter().copied())?;
-        self.inner.send_data(stream_id, b"\n".iter().copied())?;
+            .send_data(stream_id, &data_len[..varint_len])?;
+        self.inner.send_data(stream_id, data)?;
+        self.inner.send_data(stream_id, b"\n".as_slice())?;
         Ok(())
     }
 }

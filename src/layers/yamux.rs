@@ -28,6 +28,9 @@ const MAX_STREAMS: usize = 256;
 /// consuming all of the bandwidth, blocking data from others.
 const MAX_FRAME_SIZE: usize = 512 * 1024; // 512kb
 
+/// We will send at most this much data at a time on some stream.
+const MAX_SEND_SIZE: usize = 64 * 1024;
+
 #[derive(Debug, thiserror::Error)]
 #[allow(clippy::enum_variant_names)]
 pub enum Error {
@@ -110,7 +113,7 @@ pub struct OutputData<'a> {
 }
 impl<'a> PartialEq for OutputData<'a> {
     fn eq(&self, other: &Self) -> bool {
-        self.len == other.len && self.buf[self.len] == other.buf[other.len]
+        self.len == other.len && self.buf[..self.len] == other.buf[..other.len]
     }
 }
 impl<'a> core::ops::Deref for OutputData<'a> {
@@ -199,7 +202,7 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static> YamuxSession<R, W> {
     pub fn send_data(
         &mut self,
         stream_id: YamuxStreamId,
-        data: impl IntoIterator<Item = u8>,
+        data: &[u8],
     ) -> Result<(), Error> {
         let mut shared_state = self.shared_state.borrow_mut();
 
@@ -215,9 +218,11 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static> YamuxSession<R, W> {
             | Some(BufferedOutboundMessage::Open)
             | Some(BufferedOutboundMessage::WindowUpdate(_))
             | None => {
+                let mut buf = VecDeque::with_capacity(data.len());
+                buf.extend(data);
                 stream
                     .outbound_buf
-                    .push_back(BufferedOutboundMessage::Data(data.into_iter().collect()));
+                    .push_back(BufferedOutboundMessage::Data(buf));
             }
             Some(BufferedOutboundMessage::Close | BufferedOutboundMessage::Reset) => {
                 return Err(Error::StreamNotFound(stream_id));
@@ -228,7 +233,7 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static> YamuxSession<R, W> {
     }
 
     /// Schedule the stream to be closed. This waits for any other scheduled data to be
-    /// sent before inititating the close. Run [`Self::next()`] to progress this. Until the
+    /// sent before initiating the close. Run [`Self::next()`] to progress this. Until the
     /// close has been enacted, data on this stream may still be emitted.
     pub fn close_stream(&mut self, stream_id: YamuxStreamId) {
         let mut shared_state = self.shared_state.borrow_mut();
@@ -239,7 +244,7 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static> YamuxSession<R, W> {
         };
 
         if let Some(BufferedOutboundMessage::Close) = stream.outbound_buf.back() {
-            // Already schedculed to close so do nothing.
+            // Already scheduled to close so do nothing.
         } else {
             stream
                 .outbound_buf
@@ -652,7 +657,8 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static> YamuxSession<R, W> {
                         bytes_to_write.extend(YamuxHeader::window_update(stream_id, len).encode());
                     }
                     BufferedOutboundMessage::Data(mut outbound_data) => {
-                        let bytes_to_send = usize::min(stream.send_window, outbound_data.len());
+                        // Ensure that the bytes we send are capped by the send window size and MAX_SEND_SIZE.
+                        let bytes_to_send = outbound_data.len().min(stream.send_window).min(MAX_SEND_SIZE);
                         tracing::debug!(target: LOG_TARGET, "sending {bytes_to_send} DATA bytes on stream {stream_id}");
 
                         // If we can't send anything on this stream, put the message back on the queue and break
@@ -744,7 +750,7 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static> YamuxSession<R, W> {
         // If they send a duplicate stream ID, that is a protocol error so bail.
         if shared_state.streams.contains_key(&stream_id) {
             tracing::debug!(target: LOG_TARGET, "error on new incoming stream {stream_id}: duplicate stream ID");
-            return Err(Error::InvalidStreamId(stream_id));
+            return Err(Error::DuplicateStreamId(stream_id));
         }
 
         // All good; accept new stream. Don't process any data etc; that's for the main loop.
@@ -1107,7 +1113,7 @@ mod test {
             .expect("expecting output")
             .expect("not None");
 
-        assert!(matches!(res, Err(Error::InvalidStreamId(id)) if id == YamuxStreamId::new(2)));
+        assert!(matches!(res, Err(Error::DuplicateStreamId(id)) if id == YamuxStreamId::new(2)));
     }
 
     #[test]
@@ -1347,7 +1353,7 @@ mod test {
         let stream = MockStream::new();
         let mut yamux = YamuxSession::new(stream.clone(), stream);
 
-        let res = yamux.send_data(YamuxStreamId::new(99), b"hello".iter().copied());
+        let res = yamux.send_data(YamuxStreamId::new(99), b"hello".as_slice());
         assert!(matches!(res, Err(Error::StreamNotFound(id)) if id == YamuxStreamId::new(99)));
     }
 
@@ -1358,7 +1364,7 @@ mod test {
         let mut yamux = YamuxSession::new(stream.clone(), stream);
 
         let id = yamux.open_stream();
-        yamux.send_data(id, b"hello".iter().copied()).unwrap();
+        yamux.send_data(id, b"hello".as_slice()).unwrap();
 
         // First drive sends the Open header (one buffered msg per stream per call).
         let _ = block_on(yamux.next());
@@ -1402,7 +1408,7 @@ mod test {
 
         let id = yamux.open_stream();
         yamux
-            .send_data(id, b"this should be dropped".iter().copied())
+            .send_data(id, b"this should be dropped".as_slice())
             .unwrap();
         yamux.close_stream_immediately(id);
 

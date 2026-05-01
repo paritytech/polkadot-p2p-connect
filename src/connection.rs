@@ -183,7 +183,7 @@ pub enum SubscriptionResponse {
     Value(Vec<u8>),
     /// The subscription was closed or cancelled. No more values will be handed back for it.
     Closed,
-    /// Something went wrong with this subcription. No more values will be handed back for it.
+    /// Something went wrong with this subscription. No more values will be handed back for it.
     Error(SubscriptionResponseError),
 }
 
@@ -549,6 +549,8 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static, Platform: PlatformT>
                             // start waiting for the response.
                             OutputState::OutgoingAccepted(_) => {
                                 self.yamux.send_data(stream_id, &core::mem::take(request))?;
+                                // FIN: signal that we won't send any more now by closing our half.
+                                self.yamux.close_stream(stream_id);
                                 *info = RequestState::AwaitingResponsePayload;
                             }
                             // Else if the protocol is invalid we'll relay that to the user.
