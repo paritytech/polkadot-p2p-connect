@@ -208,6 +208,8 @@ impl<R: async_stream::AsyncRead + 'static, W: async_stream::AsyncWrite + 'static
     }
 
     /// Close a stream immediately, unbuffering any messages buffered to send prior to this call.
+    // Not used right now but kept here in case we decide to use it somewhere.
+    #[allow(dead_code)]
     pub fn close_stream_immediately(&mut self, stream_id: YamuxStreamId) {
         let Some(stream) = self.bufs.get_mut(&stream_id) else {
             return;
