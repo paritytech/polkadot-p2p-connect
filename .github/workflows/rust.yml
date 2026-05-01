@@ -36,6 +36,12 @@ jobs:
       - name: Check all targets
         run: cargo check --all-targets
 
+      - name: Check warp sync example
+        run: cargo check --manifest-path examples/warp-sync/Cargo.toml
+
+      - name: Check web example (rust)
+        run: cargo check --manifest-path examples/web/Cargo.toml
+
   check_no_std:
     name: Cargo check no_std
     runs-on: ubuntu-latest
