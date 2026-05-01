@@ -1,6 +1,6 @@
 [package]
 name = "polkadot-p2p-connect"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Establish peer-to-peer connections with nodes on the Polkadot network"
 license = "MIT"

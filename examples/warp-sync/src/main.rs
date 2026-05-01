@@ -6,7 +6,8 @@ use core::time::Duration;
 use parity_scale_codec::Encode;
 use polkadot_p2p_connect::{
     AsyncRead, AsyncReadError, AsyncWrite, AsyncWriteError, Configuration, Message, PlatformT,
-    RequestProtocol, RequestResponse, SubscriptionProtocol, SubscriptionResponse,
+    RequestProtocol, RequestResponse, RequestResponseError, SubscriptionProtocol,
+    SubscriptionResponse,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -166,6 +167,18 @@ async fn main() -> anyhow::Result<()> {
 
                 // Not finished yet; request the next chunk from our new finalized hash.
                 eprintln!("Requesting warp sync from #{}", grandpa_state.finalized_number);
+                conn.request(warp_sync_id, grandpa_state.finalized_hash.to_vec())?;
+            }
+            Message::Response {
+                protocol_id,
+                res: RequestResponse::Error(
+                    e @ (RequestResponseError::ProtocolRejected
+                    | RequestResponseError::ClosedByRemote),
+                ),
+                ..
+            } if protocol_id == warp_sync_id => {
+                eprintln!("Warp sync request failed ({e}), retrying after delay...");
+                tokio::time::sleep(Duration::from_secs(1)).await;
                 conn.request(warp_sync_id, grandpa_state.finalized_hash.to_vec())?;
             }
             Message::Response {
