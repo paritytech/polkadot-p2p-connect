@@ -61,8 +61,7 @@ pub enum Error {
 
 /// This handles opening and closing multiple yamux streams given an [`AsyncRead`] and [`AsyncWrite`] stream.
 pub struct YamuxSession<R, W> {
-    // AsyncReader and AsyncWriter:
-    writer: Rc<RefCell<W>>,
+    // AsyncReader:
     reader: Rc<RefCell<R>>,
     // This holds futures for reading and writing that will be run concurrently.
     read_write_join: ReadWriteJoin<Option<Output>, Error>,
@@ -77,6 +76,7 @@ pub struct YamuxSession<R, W> {
     shared_state: Rc<RefCell<SharedState>>,
     // The amount of data available on the inbound_buf.
     data_len: usize,
+    marker: core::marker::PhantomData<W>,
 }
 
 struct SharedState {
@@ -188,8 +188,7 @@ impl StreamState {
 
 impl<R: AsyncRead + 'static, W: AsyncWrite + 'static> YamuxSession<R, W> {
     /// Create a new, empty Yamux session, given some internal read/write transport.
-    pub fn new(reader: R, writer: W) -> Self {
-        let writer = Rc::new(RefCell::new(writer));
+    pub fn new(reader: R, mut writer: W) -> Self {
         let shared_state = Rc::new(RefCell::new(SharedState {
             streams: BTreeMap::new(),
             write_buf: VecDeque::new(),
@@ -198,9 +197,14 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static> YamuxSession<R, W> {
             pending_write_waker: None,
         }));
 
+        let writer_shared_state = shared_state.clone(); 
+        let read_write_join = ReadWriteJoin::new(async move {
+            Self::write_next(&mut writer, &writer_shared_state).await
+        });
+
         Self {
             reader: Rc::new(RefCell::new(reader)),
-            writer: writer.clone(),
+            read_write_join,
             next_stream_id: YamuxStreamId::first(),
             // We rely on the compiler eliding the stack allocating and allocating
             // directly on the heap here to avoid possible stack overflows, but this
@@ -208,12 +212,9 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static> YamuxSession<R, W> {
             inbound_buf: Rc::new(RefCell::new(Box::new([0u8; MAX_FRAME_SIZE]))),
             finished: false,
             // State held by read and write futures.
-            shared_state: shared_state.clone(),
+            shared_state,
             data_len: 0,
-            read_write_join: ReadWriteJoin::new(async move {
-                let writer_state = shared_state.clone();
-                Self::write_next(&mut writer.borrow_mut(), &writer_state).await
-            }),
+            marker: core::marker::PhantomData,
         }
     }
 
