@@ -557,6 +557,10 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static> YamuxSession<R, W> {
                     tracing::debug!(target: LOG_TARGET, "received WINDOW UPDATE on stream {stream_id} (flags: {flags}, delta: {length})");
                     let mut shared_state = shared_state.borrow_mut();
 
+                    // Try writes again after this; a window update means we may be
+                    // able to send more data.
+                    shared_state.flush_writes();
+
                     // Get hold of the stream details, opening a new stream if we need to.
                     let (stream, is_new) = if flags.is_open_new_stream() {
                         let Some(stream) =
@@ -592,27 +596,17 @@ impl<R: AsyncRead + 'static, W: AsyncWrite + 'static> YamuxSession<R, W> {
                         // but we'll still accept window updates and can send to them.
                         // If the stream is SYN then it's just been opened; tell the user this.
                         stream.open_state = stream.open_state.set_fin_by_them();
-
-                        // Window update means we may be able to write more, so try.
-                        shared_state.flush_writes();
-
                         return Ok(Some(Output {
                             stream_id,
                             state: OutputState::ClosedByRemote,
                         }));
                     } else if is_new {
-                        // Window update means we may be able to write more, so try.
-                        shared_state.flush_writes();
-
                         // This is a new stream, so emit a message that it is opened. New streams
                         // will never conflict with RST/FIN flags.
                         return Ok(Some(Output {
                             stream_id,
                             state: OutputState::OpenedByRemote,
                         }));
-                    } else {
-                        // Window update means we may be able to write more, so try.
-                        shared_state.flush_writes();
                     }
                 }
                 FrameType::Ping => {
