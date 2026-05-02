@@ -88,6 +88,8 @@ struct SharedState {
 }
 
 impl SharedState {
+    // Call this whenever there may be new data we want to try
+    // writing. This will wake the write future as needed.
     fn flush_writes(&mut self) {
         self.has_pending_writes = true;
         if let Some(waker) = self.pending_write_waker.take() {
